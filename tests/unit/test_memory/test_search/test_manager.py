@@ -283,6 +283,20 @@ async def test_user_keyword_returns_episodes_only() -> None:
     assert resp.data.profiles == []
 
 
+async def test_search_uses_propagated_request_id_when_bound() -> None:
+    """When a request id is bound upstream (middleware), ``search`` reuses it
+    instead of minting a fresh one, so the response id matches the trace."""
+    from everos.core.context import reset_request_id, set_request_id
+
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+    token = set_request_id("deadbeef" * 4)
+    try:
+        resp = await mgr.search(_user_req())
+        assert resp.request_id == "deadbeef" * 4
+    finally:
+        reset_request_id(token)
+
+
 async def test_user_keyword_leaves_atomic_facts_empty() -> None:
     """KEYWORD never back-fills facts — only HYBRID produces relevance-scored facts.
 
@@ -569,7 +583,9 @@ async def test_agent_hybrid_with_llm_rerank_does_not_need_reranker() -> None:
 class _StubReranker:
     """Minimal reranker stub — returns trivial scores."""
 
-    async def rerank(self, query: str, documents: Sequence[str]) -> list[Any]:
+    async def rerank(
+        self, query: str, documents: Sequence[str], **kwargs: Any
+    ) -> list[Any]:
         from everos.component.rerank.protocol import RerankResult
 
         return [RerankResult(index=i, score=1.0) for i in range(len(documents))]
@@ -936,3 +952,186 @@ async def test_agent_hybrid_llm_rerank_merges_bridged_skills_into_dense_pool(
     # The bridged skill inherits the matched case's score (0.85 from c1).
     by_id = {c.id: c for c in seen_skill_dense["dense"]}
     assert by_id["s_bridged"].score == pytest.approx(0.85)
+
+
+async def test_search_emits_memory_search_span() -> None:
+    """search() opens an everos.memory.search retriever span carrying the
+    langfuse.* attribute contract (observation type / user id / metadata)."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from everos.config.settings import ObservabilitySettings
+    from everos.core.observability.tracing import (
+        force_flush,
+        init_tracing,
+        shutdown_tracing,
+    )
+
+    exporter = InMemorySpanExporter()
+    init_tracing(
+        ObservabilitySettings(enabled=True, endpoint="http://collector.invalid"),
+        span_processor=SimpleSpanProcessor(exporter),
+    )
+    try:
+        mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+        await mgr.search(_user_req())
+        force_flush()
+        spans = {s.name: s for s in exporter.get_finished_spans()}
+        assert "everos.memory.search" in spans
+        attrs = spans["everos.memory.search"].attributes
+        assert attrs["langfuse.observation.type"] == "retriever"
+        assert attrs["langfuse.user.id"] == "alice"
+        assert attrs["langfuse.trace.metadata.owner_type"] == "user"
+        assert list(attrs["langfuse.trace.tags"]) == ["everos", "memory"]
+    finally:
+        shutdown_tracing()
+
+
+# ── Search sub-span decomposition (recall + rank phases) ────────────────
+
+
+@pytest.fixture
+def _search_spans():  # type: ignore[no-untyped-def]
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from everos.config.settings import ObservabilitySettings
+    from everos.core.observability.tracing import init_tracing, shutdown_tracing
+
+    exporter = InMemorySpanExporter()
+    shutdown_tracing()
+    init_tracing(
+        ObservabilitySettings(enabled=True, endpoint="http://collector.invalid"),
+        span_processor=SimpleSpanProcessor(exporter),
+    )
+    yield exporter
+    shutdown_tracing()
+
+
+def _span_index(exporter: Any) -> dict[str, Any]:
+    from everos.core.observability.tracing import force_flush
+
+    force_flush()
+    return {s.name: s for s in exporter.get_finished_spans()}
+
+
+async def test_keyword_user_emits_recall_no_rank(_search_spans: Any) -> None:
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    spans = _span_index(_search_spans)
+    assert "everos.search.recall" in spans
+    assert "everos.search.rank" not in spans
+    # recall nests under the search span (one trace).
+    tid = spans["everos.memory.search"].context.trace_id
+    assert spans["everos.search.recall"].context.trace_id == tid
+    assert spans["everos.search.recall"].parent is not None
+
+
+async def test_hybrid_user_emits_recall_and_rank(_search_spans: Any) -> None:
+    mgr = _build_manager(
+        episode_sparse=[_episode_row("ep_1")], embedding=_StubEmbedding()
+    )
+    await mgr.search(_user_req(method=SearchMethod.HYBRID))
+    spans = _span_index(_search_spans)
+    assert "everos.search.recall" in spans
+    assert "everos.search.rank" in spans
+
+
+async def test_keyword_agent_emits_recall_no_rank(_search_spans: Any) -> None:
+    mgr = _build_manager(case_sparse=[_case_row("c1")], skill_sparse=[_skill_row("s1")])
+    await mgr.search(_agent_req(method=SearchMethod.KEYWORD))
+    spans = _span_index(_search_spans)
+    assert "everos.search.recall" in spans
+    assert "everos.search.rank" not in spans
+
+
+async def test_hybrid_agent_emits_recall_and_rank(_search_spans: Any) -> None:
+    mgr = _build_manager(
+        case_sparse=[_case_row("c1")],
+        skill_sparse=[_skill_row("s1")],
+        embedding=_StubEmbedding(),
+        reranker=_StubReranker(),
+    )
+    await mgr.search(_agent_req(method=SearchMethod.HYBRID))
+    spans = _span_index(_search_spans)
+    assert "everos.search.recall" in spans
+    assert "everos.search.rank" in spans
+
+
+async def test_search_emits_top_score_and_hit_on_span(_search_spans: Any) -> None:
+    """search sets everos.search.top_score (max item score) + everos.search.hit
+    (>= recall_hit_threshold, default 0.6) on the retriever span — always, no
+    Langfuse needed."""
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1", score=0.75)])
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    spans = _span_index(_search_spans)
+    attrs = spans["everos.memory.search"].attributes
+    assert attrs["everos.search.top_score"] == pytest.approx(0.75)
+    assert attrs["everos.search.hit"] is True
+
+
+async def test_search_hit_false_when_below_threshold(_search_spans: Any) -> None:
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1", score=0.3)])
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    spans = _span_index(_search_spans)
+    attrs = spans["everos.memory.search"].attributes
+    assert attrs["everos.search.top_score"] == pytest.approx(0.3)
+    assert attrs["everos.search.hit"] is False
+
+
+async def test_search_top_score_zero_when_no_results(_search_spans: Any) -> None:
+    mgr = _build_manager()  # no candidates
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    spans = _span_index(_search_spans)
+    attrs = spans["everos.memory.search"].attributes
+    assert attrs["everos.search.top_score"] == pytest.approx(0.0)
+    assert attrs["everos.search.hit"] is False
+
+
+async def test_search_enqueues_recall_scores(
+    _search_spans: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When tracing is active, search hands recall_top_score/hit to the score
+    sink with the retriever span's trace_id (032x) + observation_id (016x)."""
+    import everos.memory.search.manager as mgr_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_emit(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(mgr_mod, "emit_recall_scores", fake_emit)
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1", score=0.75)])
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+
+    assert captured["top_score"] == pytest.approx(0.75)
+    assert captured["hit"] is True
+    assert captured["method"] == "keyword"
+    assert len(captured["trace_id"]) == 32
+    assert len(captured["observation_id"]) == 16
+
+
+async def test_search_captures_query_when_content_on(_search_spans: Any) -> None:
+    from everos.core.observability.tracing import set_capture_content
+
+    set_capture_content(True)
+    try:
+        mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+        await mgr.search(_user_req(method=SearchMethod.KEYWORD))  # query="hi"
+    finally:
+        set_capture_content(False)
+    import json
+
+    attrs = _span_index(_search_spans)["everos.memory.search"].attributes
+    assert json.loads(attrs["langfuse.observation.input"])["query"] == "hi"
+
+
+async def test_search_omits_query_when_content_off(_search_spans: Any) -> None:
+    mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+    await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    attrs = _span_index(_search_spans)["everos.memory.search"].attributes
+    assert "langfuse.observation.input" not in attrs

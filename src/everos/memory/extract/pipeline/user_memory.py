@@ -20,6 +20,7 @@ from everalgo.user_memory import EpisodeExtractor
 
 from everos.component.utils.datetime import from_timestamp, to_iso_format
 from everos.core.observability.logging import get_logger
+from everos.core.observability.tracing import capture_output, memory_span
 from everos.memory import Episode, IngestResult, PipelineOutcome
 from everos.memory.events import EpisodeExtracted, UserPipelineStarted
 from everos.memory.prompt_slots import PromptLoader
@@ -99,9 +100,23 @@ class UserMemoryPipeline:
             # than the per-user fan-out per the algo's docstring). Fan-out
             # is then md-only: every user sender owns a copy of the same
             # narrative under its own owner_id path.
-            algo_ep = await self._ep_ext.aextract(
-                cell, sender_id=None, prompt=episode_prompt
-            )
+            with memory_span(
+                "everos.extract",
+                observation_type="generation",
+                session_id=ingested.session_id,
+                metadata={
+                    "app_id": ingested.app_id,
+                    "project_id": ingested.project_id,
+                    "memcell_id": memcell_id,
+                },
+            ) as extract_span:
+                # Token usage is recorded onto this span by the LLM client
+                # wrapper when the extractor issues its chat() call.
+                algo_ep = await self._ep_ext.aextract(
+                    cell, sender_id=None, prompt=episode_prompt
+                )
+                # Extracted memory text (only when capture_content is on).
+                capture_output(extract_span, algo_ep.episode)
             for sender_id in user_senders:
                 ep = Episode.from_algo(
                     algo_ep,
@@ -111,15 +126,24 @@ class UserMemoryPipeline:
                     parent_id=memcell_id,
                 )
                 inline, sections = _episode_to_entry_body(ep)
-                eid = await self._episode_writer.append_entry(
-                    ep.owner_id,
-                    inline=inline,
-                    sections=sections,
-                    app_id=ingested.app_id,
-                    project_id=ingested.project_id,
-                )
-                md_paths.append(
-                    str(
+                with memory_span(
+                    "everos.persist.markdown",
+                    observation_type="span",
+                    session_id=ingested.session_id,
+                    metadata={
+                        "owner_id": ep.owner_id,
+                        "app_id": ingested.app_id,
+                        "project_id": ingested.project_id,
+                    },
+                ) as persist_span:
+                    eid = await self._episode_writer.append_entry(
+                        ep.owner_id,
+                        inline=inline,
+                        sections=sections,
+                        app_id=ingested.app_id,
+                        project_id=ingested.project_id,
+                    )
+                    md_path = str(
                         self._episode_writer.path_for(
                             ep.owner_id,
                             eid.date,
@@ -127,7 +151,9 @@ class UserMemoryPipeline:
                             project_id=ingested.project_id,
                         )
                     )
-                )
+                    md_paths.append(md_path)
+                    # Written .md path (only when capture_content is on).
+                    capture_output(persist_span, md_path)
                 await self._engine.emit(
                     EpisodeExtracted(
                         memcell_id=memcell_id,

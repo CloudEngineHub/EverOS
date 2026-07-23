@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from everos.component.llm import get_llm_client
 from everos.config import load_settings
 from everos.core.observability.logging import get_logger
+from everos.core.observability.tracing import memory_span
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.config import OMEConfig
 from everos.infra.ome.engine import OfflineEngine
@@ -170,14 +171,21 @@ async def memorize(
     boundary_cfg = settings.boundary_detection
     session_id = payload["session_id"]
 
-    async with asyncio.timeout(settings.memorize.session_lock_timeout_seconds):
-        async with get_session_lock(session_id):
-            return await _memorize_locked(
-                payload,
-                mode=mode,
-                boundary_cfg=boundary_cfg,
-                is_final=is_final,
-            )
+    span_name = "everos.memory.flush" if is_final else "everos.memory.add"
+    with memory_span(
+        span_name,
+        observation_type="span",
+        session_id=session_id,
+        metadata={"mode": mode, "is_final": is_final},
+    ):
+        async with asyncio.timeout(settings.memorize.session_lock_timeout_seconds):
+            async with get_session_lock(session_id):
+                return await _memorize_locked(
+                    payload,
+                    mode=mode,
+                    boundary_cfg=boundary_cfg,
+                    is_final=is_final,
+                )
 
 
 async def _memorize_locked(
