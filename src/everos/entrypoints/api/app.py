@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from everos.core.lifespan import (
     LifespanProvider,
     MetricsLifespanProvider,
+    TracingLifespanProvider,
     build_lifespan,
 )
 from everos.core.middleware import (
@@ -23,6 +24,7 @@ from everos.core.middleware import (
     DEFAULT_CORS_ORIGINS,
     ProfileMiddleware,
     PrometheusMiddleware,
+    RequestIdMiddleware,
 )
 from everos.core.observability.logging import get_logger
 
@@ -68,7 +70,8 @@ def create_app(
         cors_allow_methods: Allowed CORS methods (default: ``["*"]``).
         cors_allow_headers: Allowed CORS headers (default: ``["*"]``).
         lifespan_providers: Optional list of LifespanProvider; defaults to
-            ``[MetricsLifespanProvider(), SqliteLifespanProvider(),
+            ``[TracingLifespanProvider(), MetricsLifespanProvider(),
+            LLMLifespanProvider(), SqliteLifespanProvider(),
             LanceDBLifespanProvider(), CascadeLifespanProvider(),
             OmeLifespanProvider()]``.
 
@@ -79,6 +82,7 @@ def create_app(
 
     if lifespan_providers is None:
         lifespan_providers = [
+            TracingLifespanProvider(),
             MetricsLifespanProvider(),
             LLMLifespanProvider(),
             SqliteLifespanProvider(),
@@ -113,6 +117,9 @@ def create_app(
     )
     app.add_middleware(PrometheusMiddleware)
     app.add_middleware(ProfileMiddleware)
+    # Outermost: every request gets a request id before any other middleware
+    # or handler runs, so all logs + the response header carry it.
+    app.add_middleware(RequestIdMiddleware)
 
     # Routes.
     app.include_router(health.router)
