@@ -33,6 +33,7 @@ from everalgo.types import Candidate
 
 from everos.component.utils.datetime import from_timestamp, to_timestamp_ms
 from everos.core.observability.logging import get_logger
+from everos.core.observability.tracing import memory_span
 from everos.infra.persistence.sqlite import cluster_repo
 from everos.memory.search.callbacks import build_rerank_fn
 from everos.memory.search.shaper import shape_episode_from_candidate
@@ -168,15 +169,20 @@ async def search_episodes_agentic(
 
     # 4. hybrid_full: RRF fusion of dense + sparse MaxSim.
     async def hybrid_full(q: str, k: int) -> list[Candidate]:
-        return await ahybrid_retrieve(
-            q,
-            dense_retrieve=_dense,
-            sparse_retrieve=_sparse,
-            top_n=k,
-            dense_candidates=_DENSE_CANDIDATES,
-            sparse_candidates=_SPARSE_CANDIDATES,
-            rrf_k=_HYBRID_RRF_K,
-        )
+        with memory_span(
+            "everos.search.recall",
+            observation_type="retriever",
+            metadata={"phase": "agentic_hybrid"},
+        ):
+            return await ahybrid_retrieve(
+                q,
+                dense_retrieve=_dense,
+                sparse_retrieve=_sparse,
+                top_n=k,
+                dense_candidates=_DENSE_CANDIDATES,
+                sparse_candidates=_SPARSE_CANDIDATES,
+                rrf_k=_HYBRID_RRF_K,
+            )
 
     # 5. Load cluster snapshot + full-corpus all_docs (memcell-keyed).
     #    Reshape metadata to the everalgo doc contract so the sufficiency /
@@ -196,14 +202,19 @@ async def search_episodes_agentic(
 
     # 6. cluster_scoped: narrows hybrid_full to top-K cluster member expansions.
     async def cluster_scoped(q: str, _k: int) -> list[Candidate]:
-        return await acluster_retrieve(
-            q,
-            base_retrieve=hybrid_full,
-            base_candidates=_CLUSTER_BASE_CANDIDATES,
-            clusters=clusters,
-            all_docs=all_docs,
-            cluster_top_k=_CLUSTER_TOP_K,
-        )
+        with memory_span(
+            "everos.search.recall",
+            observation_type="retriever",
+            metadata={"phase": "agentic_cluster_scoped"},
+        ):
+            return await acluster_retrieve(
+                q,
+                base_retrieve=hybrid_full,
+                base_candidates=_CLUSTER_BASE_CANDIDATES,
+                clusters=clusters,
+                all_docs=all_docs,
+                cluster_top_k=_CLUSTER_TOP_K,
+            )
 
     # 7. Cross-encoder rerank fn (2-arg RerankFn, no internal truncation).
     rerank_fn = build_rerank_fn(

@@ -23,6 +23,8 @@ from collections.abc import Sequence
 
 import openai
 
+from everos.core.observability.tracing import set_generation_usage
+
 from .protocol import EmbeddingServiceError
 
 
@@ -94,5 +96,12 @@ class OpenAIEmbeddingProvider:
                 )
             except openai.OpenAIError as exc:
                 raise EmbeddingServiceError(str(exc)) from exc
+        # Surface token usage onto the active span (e.g. everos.search.embed_query).
+        # No-op when tracing is off; embeddings report only input (prompt) tokens.
+        usage = getattr(response, "usage", None)
+        set_generation_usage(
+            model=self._model,
+            input_tokens=usage.prompt_tokens if usage else None,
+        )
         # OpenAI returns ``data`` indexed by request order; truncate to ``dim``.
         return [list(item.embedding[: self.dim]) for item in response.data]
