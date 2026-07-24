@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-24
+
 ### Added
 
 - **`/api/v2` API prefix** — every business endpoint (`memory/*`, `ome/*`,
