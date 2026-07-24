@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backward-compatible alias: both prefixes resolve to the same handlers with
   identical request/response contracts, so existing integrations keep working
   unchanged. Infrastructure endpoints (`/health`, `/metrics`) stay unversioned.
+- **Native OpenTelemetry tracing** — memory operations (add / flush, memcell
+  boundary, episode extraction, search, and OME reflection) export to any
+  OTLP backend (e.g. Langfuse) as nested traces carrying LLM/embedding token
+  usage, per-request correlation, and recall-quality scores. Off by default;
+  enabled via the `[observability]` config with the optional `otel` extra.
+  Content capture (query / extracted memory) is opt-in and redaction-aware.
 
 ## [1.1.4] - 2026-07-20
 
