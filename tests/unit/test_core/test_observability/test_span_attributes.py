@@ -83,6 +83,20 @@ def test_set_generation_usage_annotates_current_span(
     assert attrs["gen_ai.usage.output_tokens"] == 22
 
 
+def test_set_generation_usage_accumulates_across_calls(
+    captured: InMemorySpanExporter,
+) -> None:
+    # A multi-call operation (e.g. agentic search issuing several chats)
+    # inside one span must SUM token usage, not overwrite with the last call.
+    with memory_span("everos.search.rank", observation_type="generation"):
+        set_generation_usage(model="gpt-x", input_tokens=10, output_tokens=5)
+        set_generation_usage(model="gpt-x", input_tokens=3, output_tokens=7)
+    force_flush()
+    attrs = captured.get_finished_spans()[0].attributes
+    assert attrs["gen_ai.usage.input_tokens"] == 13
+    assert attrs["gen_ai.usage.output_tokens"] == 12
+
+
 def test_set_generation_usage_outside_span_is_noop() -> None:
     # No active span → must not raise (and nothing to record).
     set_generation_usage(model="x", input_tokens=1, output_tokens=2)

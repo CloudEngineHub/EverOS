@@ -181,15 +181,26 @@ def set_generation_usage(
 ) -> None:
     """Record ``gen_ai.*`` model + token attributes on the current span.
 
+    Token counts ACCUMULATE: a span that wraps more than one ``chat`` call
+    (e.g. the agentic/rank search path issues several LLM calls under one
+    ``everos.search.rank`` span) sums each call's usage rather than letting
+    the last call overwrite the rest. ``model`` is set as-is (last wins).
+
     No-op when OTel is absent or there is no active recording span, so LLM
     client wrappers can call it unconditionally.
     """
     if not _OTEL_AVAILABLE:
         return
     span = _otel_trace.get_current_span()
+    # `.attributes` exists on a recording SDK span and reflects values set
+    # earlier in this span's life; a non-recording span has none (getattr
+    # falls back to {}), and set_attribute on it is itself a no-op.
+    existing = getattr(span, "attributes", None) or {}
     if model is not None:
         span.set_attribute(GEN_AI_REQUEST_MODEL, model)
     if input_tokens is not None:
-        span.set_attribute(GEN_AI_USAGE_INPUT_TOKENS, input_tokens)
+        prior = existing.get(GEN_AI_USAGE_INPUT_TOKENS, 0)
+        span.set_attribute(GEN_AI_USAGE_INPUT_TOKENS, prior + input_tokens)
     if output_tokens is not None:
-        span.set_attribute(GEN_AI_USAGE_OUTPUT_TOKENS, output_tokens)
+        prior = existing.get(GEN_AI_USAGE_OUTPUT_TOKENS, 0)
+        span.set_attribute(GEN_AI_USAGE_OUTPUT_TOKENS, prior + output_tokens)
