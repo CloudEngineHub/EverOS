@@ -90,8 +90,11 @@ class OpenAIEmbeddingProvider:
         """One ``/embeddings`` call, semaphore-guarded."""
         # Wrap in an EMBEDDING-typed span so token usage lands on an embedding
         # observation (which Langfuse can price) rather than the enclosing
-        # retriever span. No-op when tracing is off.
-        with memory_span("everos.embedding", observation_type="embedding"):
+        # retriever span. nested_only: skip when there is no active trace (e.g.
+        # cascade-time indexing) so we don't spawn one root trace per chunk.
+        with memory_span(
+            "everos.embedding", observation_type="embedding", nested_only=True
+        ):
             async with self._semaphore:
                 try:
                     response = await self._client.embeddings.create(

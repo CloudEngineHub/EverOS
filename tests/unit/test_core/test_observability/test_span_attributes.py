@@ -97,6 +97,34 @@ def test_set_generation_usage_accumulates_across_calls(
     assert attrs["gen_ai.usage.output_tokens"] == 12
 
 
+def test_nested_only_span_skips_when_no_active_parent(
+    captured: InMemorySpanExporter,
+) -> None:
+    # A nested_only span with no active parent must NOT start a new root trace
+    # (this is what prevented cascade-time embeddings from exploding into one
+    # orphan trace per chunk).
+    with memory_span(
+        "everos.embedding", observation_type="embedding", nested_only=True
+    ):
+        pass
+    force_flush()
+    assert captured.get_finished_spans() == ()
+
+
+def test_nested_only_span_opens_under_active_parent(
+    captured: InMemorySpanExporter,
+) -> None:
+    with (
+        memory_span("everos.memory.search", observation_type="retriever"),
+        memory_span("everos.embedding", observation_type="embedding", nested_only=True),
+    ):
+        pass
+    force_flush()
+    names = {s.name for s in captured.get_finished_spans()}
+    assert "everos.embedding" in names
+    assert "everos.memory.search" in names
+
+
 def test_set_generation_usage_outside_span_is_noop() -> None:
     # No active span → must not raise (and nothing to record).
     set_generation_usage(model="x", input_tokens=1, output_tokens=2)
