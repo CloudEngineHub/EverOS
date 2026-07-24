@@ -13,12 +13,14 @@ Run inside ``service.memorize`` via ``asyncio.gather`` alongside
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from everalgo.types import MemCell as AlgoMemCell
 from everalgo.user_memory import EpisodeExtractor
 
 from everos.component.utils.datetime import from_timestamp, to_iso_format
+from everos.config import resolve_root
 from everos.core.observability.logging import get_logger
 from everos.core.observability.tracing import capture_output, memory_span
 from everos.memory import Episode, IngestResult, PipelineOutcome
@@ -34,6 +36,14 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _TRACK = "user_memory"
+
+
+def _root_relative(path: str) -> str:
+    """Path relative to the memory root, for telemetry (never the host abspath)."""
+    try:
+        return str(Path(path).relative_to(resolve_root()))
+    except ValueError:
+        return path
 
 
 class UserMemoryPipeline:
@@ -152,8 +162,10 @@ class UserMemoryPipeline:
                         )
                     )
                     md_paths.append(md_path)
-                    # Written .md path (only when capture_content is on).
-                    capture_output(persist_span, md_path)
+                    # Written .md path, memory-root-relative (only when
+                    # capture_content is on) — never leak the host absolute
+                    # path to the telemetry backend.
+                    capture_output(persist_span, _root_relative(md_path))
                 await self._engine.emit(
                     EpisodeExtracted(
                         memcell_id=memcell_id,

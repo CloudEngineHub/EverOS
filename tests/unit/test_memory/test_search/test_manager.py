@@ -1182,6 +1182,27 @@ async def test_search_captures_query_when_content_on(_search_spans: Any) -> None
     assert json.loads(attrs["langfuse.observation.input"])["query"] == "hi"
 
 
+async def test_search_captures_returned_hits_when_content_on(
+    _search_spans: Any,
+) -> None:
+    """capture_content on → the search span records the returned hit ids
+    (episodes/agent_cases/agent_skills), not just the query."""
+    from everos.core.observability.tracing import set_capture_content
+
+    set_capture_content(True)
+    try:
+        mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
+        await mgr.search(_user_req(method=SearchMethod.KEYWORD))
+    finally:
+        set_capture_content(False)
+    import json
+
+    attrs = _span_index(_search_spans)["everos.memory.search"].attributes
+    out = json.loads(attrs["langfuse.observation.output"])
+    assert out["episodes"] == ["ep_1"]
+    assert out["agent_cases"] == [] and out["agent_skills"] == []
+
+
 async def test_search_omits_query_when_content_off(_search_spans: Any) -> None:
     mgr = _build_manager(episode_sparse=[_episode_row("ep_1")])
     await mgr.search(_user_req(method=SearchMethod.KEYWORD))

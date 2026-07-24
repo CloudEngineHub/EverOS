@@ -42,6 +42,7 @@ from everos.core.context import resolve_request_id
 from everos.core.observability.logging import get_logger
 from everos.core.observability.tracing import (
     capture_input,
+    capture_output,
     current_trace_ids,
     emit_recall_scores,
     memory_span,
@@ -229,6 +230,17 @@ class SearchManager:
                     agent_skills=skills,
                     unprocessed_messages=unprocessed,
                 )
+
+            # Returned hits (ids only) — content, so only when capture_content
+            # is on. This is the point of a search trace: what came back.
+            capture_output(
+                span,
+                {
+                    "episodes": [e.id for e in data.episodes],
+                    "agent_cases": [c.id for c in data.agent_cases],
+                    "agent_skills": [s.id for s in data.agent_skills],
+                },
+            )
 
             # Recall-quality signal on the span (always on; the Langfuse
             # scores push is separate and gated on creds — see the score sink).
