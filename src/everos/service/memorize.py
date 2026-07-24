@@ -2,7 +2,7 @@
 
 End-to-end orchestration:
 
-    POST /api/v1/memory/add { session_id, messages[] }
+    POST /api/v2/memory/add { session_id, messages[] }
         → ingest.process → IngestResult
         → _boundary.prepare_cells(mode=settings.memorize.mode) → cells
         → asyncio.gather(

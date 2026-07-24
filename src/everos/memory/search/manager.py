@@ -1,4 +1,4 @@
-"""SearchManager — top-level orchestrator for ``POST /api/v1/memory/search``.
+"""SearchManager — top-level orchestrator for ``POST /api/v2/memory/search``.
 
 Hard partition by ``owner_type``:
 

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/api/v2` API prefix** — every business endpoint (`memory/*`, `ome/*`,
+  `knowledge/*`) is now served under `/api/v2`, aligning the open-source API
+  with the EverOS Cloud contract. `/api/v1` is retained as a permanent,
+  backward-compatible alias: both prefixes resolve to the same handlers with
+  identical request/response contracts, so existing integrations keep working
+  unchanged. Infrastructure endpoints (`/health`, `/metrics`) stay unversioned.
+
 ## [1.1.4] - 2026-07-20
 
 ### Added
