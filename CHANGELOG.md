@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`MemoryRoot.default()` → `MemoryRoot.resolve()`** — the classmethod that
+  resolves the memory root from `--root` / `EVEROS_ROOT` / default was
+  renamed to make its behavior explicit (`resolve` walks the precedence
+  chain; `default` was ambiguous with "default location"). `MemoryRoot`
+  is publicly exported from `everos.core.persistence`; callers outside
+  the repo may have used the old name. **A `default()` alias is kept**
+  as a backward-compatibility shim that forwards to `resolve()` and
+  emits a `DeprecationWarning`. The alias will be removed in a future
+  major release — update call sites when convenient.
 - **Uncalibrated recall scores moved to their own name** — `KEYWORD` and
   single-route `VECTOR` searches now report their top score as
   `recall_top_score_raw`; `recall_top_score` is reserved for the calibrated
