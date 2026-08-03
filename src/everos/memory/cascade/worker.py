@@ -75,12 +75,23 @@ DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS = 10.0
 DEFAULT_OPTIMIZE_HEARTBEAT_SECONDS = 60.0
 _OPTIMIZE_FAILURE_ALERT_THRESHOLD = 5
-"""Consecutive ``optimize()`` failures (per kind) before the log is
-escalated from ``warning`` to ``error``. A one-off failure is benign
-(next tick retries); a sustained streak means compaction + version
-cleanup are stuck and the index dir will grow unbounded — that must
-surface to health checks / alerting rather than rot as a warning nobody
-reads (the failure mode behind lance-format/lance#7653)."""
+"""Consecutive **non-benign** ``optimize()`` failures (per kind) before
+the log escalates ``warning``→``error``, a fallback rebuild is triggered
+(:meth:`_run_rebuild_once`), and :meth:`CascadeWorker.health` reports the
+kind degraded. A benign light-beat commit conflict (lost concurrency
+race) is expected under churn, logged at ``debug``, and does **not**
+count — otherwise the streak pins high on a busy table and drowns the
+real signal (the disk-bloat failure mode behind lance-format/lance#7653)."""
+_DRAIN_FAILURE_ALERT_THRESHOLD = 3
+"""Consecutive :meth:`drain_once` exceptions at or above which
+:meth:`CascadeWorker.health` reports degraded — the md → LanceDB
+projection is not making progress, so accepted writes are not indexed."""
+_PRUNE_STALE_FACTOR = 3.0
+"""Multiple of the prune interval without any successful prune before
+:meth:`CascadeWorker.health` reports degraded. The primary disk-bloat
+signal — fires whether the cause is lost commit-conflict races, a stuck
+heavy beat, or a wedged worker, without depending on a particular
+exception showing up."""
 _MAX_TOTAL_RETRIES = 12
 """Total retry budget across scanner re-enqueue cycles.
 
@@ -118,29 +129,45 @@ in the regular hot path will do the same job for ~free.
 """
 
 DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS = 300.0
-"""How often (per kind) to add ``cleanup_older_than`` to ``optimize()``.
+"""**Cadence** — how often (per kind) the heavy write-locked
+:meth:`LanceRepoBase.prune` beat runs, vs the light lock-free
+:meth:`~LanceRepoBase.optimize` compaction on every other tick.
 
-``optimize()`` without ``cleanup_older_than`` compacts fragments and
-merges new data into indexes, but **leaves stale physical files on disk
-forever** (replaced data fragments, historical manifests, stale index
-UUID files). On a lightweight (single-user / small-team) deployment
-with steady-state cascade ingest, that file count grows without bound
-and eventually
-exhausts file descriptors at index-scan time (observed: macOS / Linux
-default ``ulimit -n`` of 1024 — the ``os error 24`` reported in CI).
-
-The prune itself is cheap when scoped to recent versions; we just don't
-want to pay it on every optimize throttle tick. 5 minutes is the
-shortest interval that comfortably outlives any in-flight query / index
-build, while keeping the on-disk footprint bounded. It is also passed
-as ``cleanup_older_than`` itself (semantically: "the retention window
-equals the prune cadence") — every file replaced more than one cadence
-ago becomes eligible.
+prune holds the per-table write lock (brief same-table write stall,
+~seconds on a churned table), so it runs on this slow beat rather than
+every throttle tick. This is the *frequency* of reclamation; how much
+history each prune keeps is a separate knob — see
+:data:`DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS`.
 
 Does **not** shrink active index internals (FTS ``part_N`` count or
 vector index UUID count): those only collapse via ``drop_index +
 create_index``, which is intentionally out of scope here.
 """
+
+DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS = 60.0
+"""**Retention window** — ``cleanup_older_than`` passed to prune: files
+belonging to dataset versions replaced more than this long ago become
+eligible for physical deletion.
+
+Decoupled from (and much shorter than) the prune *cadence*: prune runs
+under the per-table write lock, so no concurrent writer can be
+referencing an old version, and the only thing the window must outlive
+is an **in-flight read** (a ``/search`` holding a version reference) —
+sub-second to a few seconds. 60s is comfortably safe.
+
+Why short matters: under sustained churn each compaction leaves a
+full-table-sized *superseded* fragment behind; the retention window is
+how long those pile up before reclamation. The storage soak showed a
+300s window × the churn rate retaining ~24 full-table copies (a
+transient ~15G/table peak that reclaimed to ~625MB live once churn
+eased). Shrinking the window to 60s cuts that transient footprint ~5×
+without changing the reclaimed floor. Tune via the constructor."""
+
+_PRUNE_STALE_SECONDS_ALERT = (
+    _PRUNE_STALE_FACTOR * DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS
+)
+"""Absolute prune-staleness alert threshold (seconds) = 900s under the
+shipped 300s prune cadence (three missed heavy beats)."""
 
 
 @dataclass
@@ -156,14 +183,26 @@ class _KindOptimizerState:
     per kind so concurrent LanceDB writes never collide on the same
     table's manifest.
 
-    ``last_prune_at`` is the monotonic timestamp of the last
-    ``optimize()`` call that passed ``cleanup_older_than``; the runner
-    consults it to decide whether the next call should also prune. ``0``
-    means "never pruned" — the first run after worker startup always
-    prunes, which is what we want for catching up from a prior session.
+    Two prune clocks, deliberately split:
+
+    - ``last_prune_attempt_at`` gates **scheduling** — the monotonic time
+      of the last heavy (prune) beat *attempt*, advanced whether it
+      succeeds or times out. So a prune that hangs and is killed by the
+      write-lock timeout backs off a full cadence before the next attempt
+      instead of retrying every ~10s and holding the lock ~97% of the
+      time (review N1).
+    - ``last_prune_at`` records the last *successful* prune, advanced only
+      after the call returns. It drives the prune-staleness **health**
+      signal (:meth:`CascadeWorker._prune_stale_seconds`), so a
+      persistently failing/hanging prune still surfaces as degraded
+      instead of being masked by advancing the schedule clock.
+
+    Both default ``0`` ("never") — the first run after worker startup
+    always prunes, catching up from a prior session.
     """
 
     last_run_at: float = 0.0
+    last_prune_attempt_at: float = 0.0
     last_prune_at: float = 0.0
     dirty: bool = False
     optimize_failures: int = 0
@@ -180,6 +219,72 @@ class _KindOptimizerState:
     ``rebuild_task`` before touching the LanceDB manifest, so the two
     operations never race on commits — only the dispatch slot is split.
     """
+
+
+@dataclass(frozen=True)
+class CascadeWorkerHealth:
+    """Snapshot of the worker's in-memory health signals.
+
+    Cheap to produce (no IO — pure in-process counters). The orchestrator
+    combines it with the SQLite queue summary for the full verdict.
+    """
+
+    drain_consecutive_failures: int
+    """Consecutive :meth:`drain_once` exceptions; 0 when the last drain
+    completed cleanly."""
+
+    unrecoverable_total: int
+    """Cumulative unrecoverable handler failures since worker start —
+    each is a md file whose projection to LanceDB permanently failed
+    and now needs a user edit (surfaced by ``cascade fix``)."""
+
+    optimize_failure_streak: int
+    """Max consecutive non-benign optimize/prune failure count across
+    kinds; benign light-beat commit conflicts do not count."""
+
+    prune_stale_seconds: float
+    """Seconds since the most recent successful prune (version cleanup)
+    across all active kinds, measured from worker start if none has run
+    yet. ``0`` when there has been no write activity to prune."""
+
+    def reasons(self) -> list[str]:
+        """Operational degradation reasons; empty when healthy.
+
+        Combined with the SQLite ``failed_permanent`` count in
+        :meth:`CascadeOrchestrator.health` to produce the ``/health``
+        verdict. These in-memory signals do not include the permanent-
+        failure backlog (that needs a query)."""
+        out: list[str] = []
+        if self.drain_consecutive_failures >= _DRAIN_FAILURE_ALERT_THRESHOLD:
+            out.append(
+                f"drain loop failing ({self.drain_consecutive_failures} in a row)"
+            )
+        if self.optimize_failure_streak >= _OPTIMIZE_FAILURE_ALERT_THRESHOLD:
+            out.append(f"optimize stuck ({self.optimize_failure_streak} in a row)")
+        if self.prune_stale_seconds >= _PRUNE_STALE_SECONDS_ALERT:
+            out.append(
+                f"version cleanup stalled ({int(self.prune_stale_seconds)}s "
+                "since last prune — disk may grow)"
+            )
+        return out
+
+
+def _is_benign_commit_conflict(exc: BaseException) -> bool:
+    """True for a LanceDB optimistic-concurrency retry error.
+
+    LanceDB surfaces the Rust ``Retryable commit conflict`` as a plain
+    exception whose message carries the phrase — there is no dedicated
+    class to catch. On the lock-free light beat this is expected under
+    concurrent writes and benign (the next beat retries), so it is
+    logged at ``debug`` and does not count toward the failure streak.
+
+    Match only the specific ``commit conflict`` phrase (a substring of the
+    Rust message), not a bare ``retryable`` — the latter appears in the
+    repr of unrelated recoverable errors (e.g. ``ExternalServiceError``
+    carrying ``retryable=True``) and would silently swallow real failures
+    (review P2).
+    """
+    return "commit conflict" in str(exc).lower()
 
 
 class CascadeWorker:
@@ -203,6 +308,9 @@ class CascadeWorker:
         optimize_prune_interval_seconds: float = (
             DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS
         ),
+        optimize_prune_retention_seconds: float = (
+            DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS
+        ),
         optimize_rebuild_interval_seconds: float = (
             DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS
         ),
@@ -215,17 +323,23 @@ class CascadeWorker:
         self._optimize_min_interval = optimize_min_interval_seconds
         self._optimize_heartbeat = optimize_heartbeat_seconds
         self._optimize_prune_interval = optimize_prune_interval_seconds
+        self._optimize_prune_retention = optimize_prune_retention_seconds
         self._optimize_rebuild_interval = optimize_rebuild_interval_seconds
         self._task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._rebuild_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._optimizer_states: dict[str, _KindOptimizerState] = {}
+        # ── in-memory health signals (see :meth:`health`) ──────────────
+        self._started_at: float = 0.0
+        self._drain_consecutive_failures: int = 0
+        self._unrecoverable_total: int = 0
 
     async def start(self) -> None:
         if self._task is not None:
             return
         self._stop.clear()
+        self._started_at = time.monotonic()
         self._task = asyncio.create_task(self._run_loop(), name="cascade-worker")
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="cascade-worker-heartbeat"
@@ -329,14 +443,52 @@ class CascadeWorker:
         await self._flush_optimizers()
         return total
 
+    def health(self) -> CascadeWorkerHealth:
+        """Snapshot the worker's in-memory health signals (no IO).
+
+        Combines the drain-loop and unrecoverable counters with the worst
+        per-kind optimize streak and the prune-staleness clock.
+        """
+        states = self._optimizer_states.values()
+        optimize_failure_streak = max((s.optimize_failures for s in states), default=0)
+        return CascadeWorkerHealth(
+            drain_consecutive_failures=self._drain_consecutive_failures,
+            unrecoverable_total=self._unrecoverable_total,
+            optimize_failure_streak=optimize_failure_streak,
+            prune_stale_seconds=self._prune_stale_seconds(),
+        )
+
+    def _prune_stale_seconds(self) -> float:
+        """Seconds since the most recent successful prune across kinds,
+        measured from worker start when nothing has pruned yet.
+
+        Returns ``0`` before the worker has started (``_started_at == 0``)
+        or before any kind has registered an optimizer state — no prune
+        beat has run yet, so there is nothing to be stale about. Once a
+        beat registers state, staleness is the time since the newest
+        ``last_prune_at`` (or since start, whichever is later).
+        """
+        states = list(self._optimizer_states.values())
+        if not states or self._started_at == 0.0:
+            return 0.0
+        latest_prune = max(s.last_prune_at for s in states)
+        baseline = max(latest_prune, self._started_at)
+        return max(0.0, time.monotonic() - baseline)
+
     # ── internals ──────────────────────────────────────────────────────────
 
     async def _run_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 processed = await self.drain_once()
+                self._drain_consecutive_failures = 0
             except Exception as exc:
-                logger.exception("cascade_worker_drain_failed", error=str(exc))
+                self._drain_consecutive_failures += 1
+                logger.exception(
+                    "cascade_worker_drain_failed",
+                    error=str(exc),
+                    consecutive_failures=self._drain_consecutive_failures,
+                )
                 processed = 0
             if processed == 0:
                 try:
@@ -422,10 +574,12 @@ class CascadeWorker:
                 return None
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self._unrecoverable_total += 1
                 logger.exception(
                     "cascade_worker_unrecoverable",
                     md_path=row.md_path,
                     kind=row.kind,
+                    unrecoverable_total=self._unrecoverable_total,
                 )
                 await md_change_state_repo.mark_failed(
                     row.md_path,
@@ -538,11 +692,14 @@ class CascadeWorker:
     async def _run_optimize_once(self, kind: str) -> None:
         """Run one ``optimize()`` for ``kind``, opportunistically pruning.
 
-        Most calls take the **light** path — pure compaction + index
-        merge, fast. Every ``_optimize_prune_interval`` seconds the
-        next call takes the **heavy** path: same work plus
-        ``cleanup_older_than`` so the storage layer physically deletes
-        files belonging to versions older than one cadence.
+        Most calls take the **light** path — lock-free ``optimize()``,
+        pure compaction + index merge, fast. Every
+        ``_optimize_prune_interval`` seconds the next call takes the
+        **heavy** path — ``prune()`` under the per-table write lock,
+        which compacts *and* physically deletes files belonging to
+        versions older than ``_optimize_prune_retention`` (a short
+        window decoupled from the beat cadence; see
+        :data:`DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS`).
 
         Pruning is opt-in per call rather than a separate task so the
         existing per-kind serialisation (one in-flight runner per kind)
@@ -557,17 +714,34 @@ class CascadeWorker:
         now = time.monotonic()
         should_prune = (
             state is None
-            or (now - state.last_prune_at) >= self._optimize_prune_interval
-        )
-        cleanup = (
-            dt.timedelta(seconds=self._optimize_prune_interval)
-            if should_prune
-            else None
+            or (now - state.last_prune_attempt_at) >= self._optimize_prune_interval
         )
         try:
-            await repo.optimize(cleanup_older_than=cleanup)
-            if should_prune and state is not None:
-                state.last_prune_at = now
+            if should_prune:
+                # Heavy beat: physically reclaim old versions under the
+                # per-table write lock (inside ``repo.prune``) so churn
+                # can't preempt the cleanup commit. ``prune`` uses
+                # ``delete_unverified=False`` so it stays safe even against a
+                # second process (CLI ``cascade sync``). The retention window
+                # is short + decoupled from the cadence (see
+                # DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS) so superseded
+                # full-table copies don't pile up between beats.
+                #
+                # Advance the *attempt* clock before the call: if prune hangs
+                # and the write-lock timeout kills it, the next beat still
+                # waits a full cadence instead of retrying immediately and
+                # pinning the write lock (review N1). The *success* clock
+                # (last_prune_at, for the staleness health signal) advances
+                # only after the call returns.
+                if state is not None:
+                    state.last_prune_attempt_at = now
+                await repo.prune(dt.timedelta(seconds=self._optimize_prune_retention))
+                if state is not None:
+                    state.last_prune_at = now
+            else:
+                # Light beat: lock-free compaction. A commit conflict here
+                # is benign — handled below.
+                await repo.optimize()
             if state is not None:
                 state.optimize_failures = 0
             logger.debug(
@@ -576,6 +750,19 @@ class CascadeWorker:
                 pruned=should_prune,
             )
         except Exception as exc:
+            # Benign light-beat commit conflict: the lock-free compaction
+            # lost the optimistic-concurrency race against a live writer.
+            # Expected under churn, self-heals next beat — log at debug and
+            # do NOT count it toward the streak (which would otherwise pin
+            # high on a busy table) or trigger a fallback rebuild. The heavy
+            # beat runs under the write lock, so it can't hit this benignly.
+            if not should_prune and _is_benign_commit_conflict(exc):
+                logger.debug(
+                    "cascade_lancedb_optimize_conflict",
+                    kind=kind,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
             failures = 0
             if state is not None:
                 state.optimize_failures += 1

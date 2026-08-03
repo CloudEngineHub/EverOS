@@ -34,7 +34,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable
+from importlib.resources import files
 from pathlib import Path
 
 import httpx
@@ -135,6 +137,14 @@ async def core_pipeline_runtime(
         monkeypatch.setattr(svc, attr, None, raising=False)
     monkeypatch.setattr(client_mod, "_llm_client", None, raising=False)
     _reset_strategy_singletons(monkeypatch)
+
+    # The full-app lifespan starts OME, whose config reloader requires an
+    # ``ome.toml`` in the memory root (normally created by ``everos init``).
+    # Provision the packaged default so the pipeline e2e can boot; OME
+    # strategies are code-registered (see api/lifespans/ome.py), so the
+    # default config is sufficient for extraction.
+    default_ome = files("everos.config") / "default_ome.toml"
+    shutil.copyfile(str(default_ome), str(tmp_path / "ome.toml"))
 
     yield tmp_path
 
