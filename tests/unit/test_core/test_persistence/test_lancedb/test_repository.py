@@ -744,6 +744,129 @@ async def test_prune_holds_write_lock_and_is_cross_process_safe(
     assert captured["cleanup_older_than"] == dt.timedelta(seconds=42)
 
 
+async def test_prune_times_out_and_releases_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung lance cleanup must not hold the per-table write lock forever.
+
+    On expiry the body is cancelled, the lock is released so writers on that
+    table are not wedged, and the timeout surfaces as
+    :class:`VectorStoreBusyError` — deliberately a *retryable* error, so the
+    cascade worker retries the row instead of marking it permanently failed.
+    """
+    from everos.core.errors import ExternalServiceError, VectorStoreBusyError
+    from everos.core.persistence.lancedb import repository as repo_mod
+
+    monkeypatch.setattr(repo_mod, "_PRUNE_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingTable:
+        async def optimize(self, **_kw):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(30)  # never returns within the timeout
+
+        async def uri(self) -> str:
+            return str(tmp_path)
+
+    repo = _NoteRepo(table=_HangingTable())  # type: ignore[arg-type]
+    with pytest.raises(VectorStoreBusyError) as excinfo:
+        await repo.prune(dt.timedelta(seconds=60))
+
+    assert isinstance(excinfo.value, ExternalServiceError), (
+        "must be retryable — under VectorStoreError the worker would mark the "
+        "row permanently failed and need a manual `cascade fix`"
+    )
+    assert not repo._write_lock(repo.table_name).locked(), (
+        "the write lock must be released after the timeout, otherwise a hung "
+        "cleanup wedges every writer on this table"
+    )
+    # And the lock is genuinely reusable afterwards.
+    async with repo._write_lock(repo.table_name):
+        pass
+
+
+async def test_waiting_for_a_stuck_holder_also_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**No path may wait for this lock indefinitely.**
+
+    The deadline covers acquisition, not just the body. Without that, one
+    operation that hangs while holding the lock wedges the table for good:
+    every writer blocks on acquire, and the maintenance scheduler skips a kind
+    whose task never finishes, so that table stops reclaiming versions forever
+    (observed in a soak run — 150 versions retained, disk 11x live size, and
+    *no* error logged anywhere, because nothing failed; it simply never
+    returned).
+    """
+    from everos.core.errors import VectorStoreBusyError
+    from everos.core.persistence.lancedb import repository as repo_mod
+
+    monkeypatch.setattr(repo_mod, "_WRITE_TIMEOUT_SECONDS", 0.05)
+
+    class _NoopTable:
+        async def add(self, _records):  # type: ignore[no-untyped-def]
+            return None
+
+    repo = _NoteRepo(table=_NoopTable())  # type: ignore[arg-type]
+
+    # Simulate a holder that never gives the lock back.
+    lock = repo._write_lock(repo.table_name)
+    await lock.acquire()
+    try:
+        with pytest.raises(VectorStoreBusyError):
+            await repo.add([_row(owner="u1", entry="n1")])
+    finally:
+        lock.release()
+
+    # Once the stuck holder is gone, the table works again — the timeout
+    # bounded the wait without breaking anything.
+    await repo.add([_row(owner="u1", entry="n2")])
+
+
+def test_write_budgets_are_sized_from_measurements_not_guesses() -> None:
+    """Write budgets must stay in the tens of seconds, not hundreds.
+
+    The budget doubles as the detection latency for a wedged table: a stuck
+    holder is invisible until its deadline expires. Measured write durations
+    are 2-25ms (worst observed 63ms across 10k-100k row tables and 50-500 row
+    batches), so tens of seconds is already ~10^3 headroom. A budget in the
+    hundreds of seconds would mean minutes of blocked writers before anything
+    is reported, which is what this whole change exists to prevent.
+    """
+    from everos.core.persistence.lancedb.repository import (
+        _PRUNE_TIMEOUT_SECONDS,
+        _REBUILD_TIMEOUT_SECONDS,
+        _WRITE_TIMEOUT_SECONDS,
+    )
+
+    assert 5.0 <= _WRITE_TIMEOUT_SECONDS <= 30.0, (
+        "row writes are millisecond operations; a budget outside this range is "
+        "either too tight to survive a contended lock or too slack to detect a "
+        "wedged table promptly"
+    )
+    # Rebuild is the one legitimately slow section, so it gets more — but the
+    # ordering must hold: a rebuild budget below prune's would make the slowest
+    # operation the most eagerly killed.
+    assert _REBUILD_TIMEOUT_SECONDS > _PRUNE_TIMEOUT_SECONDS > _WRITE_TIMEOUT_SECONDS
+
+
+def test_prune_timeout_is_well_below_the_prune_cadence() -> None:
+    """The timeout is a hang-catcher, not a bound on normal runtime.
+
+    A real cleanup is milliseconds even on a heavily churned table, so the
+    value only matters when lance hangs — and then it must expire well before
+    the next heavy beat is due, or the lock is held for most of every cadence
+    (the ~97%-duty-cycle bug: timeout == cadence, so a hung prune was retried
+    ~immediately after each expiry).
+    """
+    from everos.core.persistence.lancedb.repository import _PRUNE_TIMEOUT_SECONDS
+    from everos.memory.cascade.worker import (
+        DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS,
+    )
+
+    assert _PRUNE_TIMEOUT_SECONDS < DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS / 2, (
+        "prune timeout must leave a real write window before the next beat"
+    )
+
+
 async def test_prune_removes_empty_index_dir_husks(tmp_path: Path) -> None:
     """After cleanup, ``prune`` removes the empty ``_indices/<uuid>/`` dirs
     that ``cleanup_older_than`` leaves behind, but keeps non-empty ones."""
