@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[cascade]` settings section** — the four maintenance cadences
+  (`optimize_heartbeat_seconds`, `optimize_prune_interval_seconds`,
+  `optimize_prune_retention_seconds`, `optimize_rebuild_interval_seconds`) are
+  now configurable. They were already constructor arguments on `CascadeWorker`,
+  but `CascadeConfig` did not carry them and no production path passed one, so
+  the defaults were unreachable — which is why the 12h rebuild sweep could not
+  be exercised by any soak run shorter than half a day. The deadlines that
+  bound a hung call are deliberately **not** exposed: they are hang-catchers
+  sized from measured durations, where too low manufactures failures on a
+  healthy table and too high leaves a wedged one invisible for longer. Note
+  `optimize_prune_retention_seconds` has a second effect worth reading before
+  tuning — it also decides how long index files keep a manifest naming them,
+  and below LanceDB's 7-day unverified window they then wait out the full 7
+  days.
+
+### Fixed
+
+- **Reads now carry a deadline** (`count` / `get_by_id` / `find_where` /
+  `find_where_paginated` / `search`). The write-side deadline work skipped them
+  on the reasoning that a read takes no lock and so blocks no writer — true, but
+  the cascade drain loop reads on every batch and advances strictly one batch at
+  a time, so a read that never returns stops the **whole md → LanceDB
+  projection**: claimed rows stay `processing` forever, nothing new is indexed,
+  and `/health` still reports healthy because a hang raises nothing. Budget 60s
+  (~1000x the measured 62ms flat scan over 117k rows); expiry raises the
+  retryable `VectorStoreBusyError`.
+- **Background loops are supervised.** The drain / heartbeat / rebuild loops were
+  plain `create_task` coroutines: one uncaught exception ended that loop
+  permanently, and because the worker holds a strong reference to the task the
+  interpreter never printed "Task exception was never retrieved" either — the
+  loop's job simply stopped happening with zero output. Each now runs under a
+  supervisor that logs and restarts with escalating backoff (5s / 15s / 45s),
+  then asks the process to exit via `SIGTERM` so a restarting supervisor
+  (systemd, Docker, k8s) can recover it. The restart budget counts consecutive
+  *quick* crashes, not crashes over the process lifetime — a body that ran 60s+
+  before raising starts a fresh incident, so independent transients days apart
+  cannot pool into a process exit (same windowed counting as systemd's
+  `StartLimitIntervalSec`). A done-callback covers the case the supervisor
+  itself ends unexpectedly.
+- **The optimize-failure alert is reachable again.** The fallback rebuild reset
+  the same counter the health verdict reads, so a table failing 100% of the time
+  cycled `1..5 → 0 → 1..` and the threshold value existed only during the
+  sub-second rebuild — roughly 1% observable against a 30s scrape, so
+  `cascade.healthy` stayed green while the table never reclaimed a version. The
+  rate limiter now lives in its own counter (`failures_since_fallback`); only a
+  successful optimize clears the alert streak. Same shape as the cross-kind
+  `max()` masking bug: a remediation path refreshing the signal meant to report
+  it.
+- **A rebuild no longer leaves the column without an FTS index.** `rebuild_indexes`
+  dropped every index and recreated it, on the assumption that LanceDB falls
+  back to a brute-force scan meanwhile. That holds for vector search and **not**
+  for FTS: with no inverted index a BM25 query raises `Cannot perform full text
+  search unless an INVERTED index has been created`, and since the recall legs
+  are gathered without `return_exceptions`, one failing leg 500s the whole
+  search request. Now uses `create_index(replace=True)`, which swaps atomically
+  — measured 0 failures across 49 queries spanning 3 replaces, versus 55
+  failures for the same test against drop-then-create — and collapses the live
+  index fragment set exactly as before (7 index files back to 4).
+- **The empty-index-dir sweep is bounded by lance's own threshold.** lance's
+  `cleanup.rs` unlinks a superseded index's files but never its directory — it
+  contains no `rmdir` at all, which is structural rather than an oversight: it
+  targets object stores, where paths are flat keys and an empty directory does
+  not exist. Only a local filesystem materialises them, and a soak run reached
+  13061 dirs, 98% empty. everos sweeps them, now with three independent
+  guarantees instead of a self-chosen age: `rmdir` cannot delete a non-empty
+  directory (the kernel refuses it, so no file can be lost and there is no
+  check-then-act window), live index UUIDs are excluded via `list_indices()`,
+  and anything else must outlive `UNVERIFIED_THRESHOLD_DAYS = 7` — lance's own
+  bound for deciding an unreferenced index UUID is dead rather than mid-build.
+  The previous 300s was our invention, which is what made it indefensible.
+  Two consequences worth knowing: the age gate reads the dir's mtime, which
+  POSIX bumps when lance's cleanup empties it, so the effective reclaim horizon
+  is up to ~14 days (file wait + age gate) and the ceiling-load steady state is
+  ~1.8M dirs / ~7GB; and a sweep that blows its 60s deadline is swallowed
+  inside `prune()` — the cleanup commit already succeeded, so escaping would
+  bill a prune "failure" (feeding the fallback-rebuild threshold) and stall the
+  prune-staleness clock for a cleanup stall that did not happen.
+- **The optimize runner's wait on an in-flight rebuild is bounded too.** The two
+  maintenance jobs park on each other — whichever arrives second waits — so an
+  unbounded wait on this side is the same hazard as the one already fixed on
+  the rebuild side, just seen from the other end: the kind's task slot stays
+  occupied, `_schedule_optimize` keeps short-circuiting on it, and that table
+  quietly stops being pruned. It was left open on the argument that
+  `rebuild_indexes` carries its own 300s deadline, which covers its critical
+  section but not the task's dispatch and teardown, so the transitive bound was
+  never real. Now bounded at 180s, logging
+  `cascade_lancedb_optimize_skipped_rebuild_unfinished` and skipping the beat
+  rather than compacting under a live rebuild — the two commit on the same
+  manifest, which is what the wait exists to prevent.
+- **A rebuild that loses a commit race is retried** instead of waiting out the
+  full 12h cadence. Lance labels the conflict `Retryable` and it is: a
+  concurrent writer in another process won the manifest, nothing is wrong with
+  the table. Retries are scheduled on the kind (10min / 30min / 3h) rather than
+  slept through, so the other kinds in the sweep are not parked behind the
+  backoff. A soak run at a 600s cadence hit 3 conflicts in 119 attempts, all
+  while a concurrent CLI storm was running.
+
+- **The index-rebuild sweep can no longer park forever** waiting on the
+  optimize runner. That wait had no deadline, and the runner's loop condition is
+  "keep going while there is unindexed data" — which under sustained writes is
+  never, since the drain loop re-raises the flag every second against a 10s
+  cooldown. Now bounded at 180s, logging
+  `cascade_lancedb_rebuild_skipped_optimize_unfinished` and skipping the sweep
+  rather than dropping indices under a live optimize. **This makes the stall
+  visible, not absent**: under sustained ingest every sweep still times out, so
+  active index-UUID / FTS `part_N` growth stays unbounded there. The functional
+  fix requires the optimize runner to yield when a rebuild is pending, which
+  changes the optimize/rebuild mutual-exclusion contract and needs its own
+  validation — the rebuild cadence is 12h, longer than any soak run so far, so
+  the periodic sweep has never been exercised under load.
+- **The memory-root lock wait is bounded and visible.** Acquisition polls with
+  `LOCK_NB` instead of blocking inside a worker thread: a blocking `flock` could
+  not be bounded or cancelled — cancelling the awaiting coroutine left the
+  thread to acquire the lock later with nobody to release it. The wait itself is
+  by design (the second process is supposed to wait, then find the migration
+  already done), but it now logs `memory_root_lock_waiting` and gives up after
+  `timeout_seconds` (default 30min) instead of leaving a server startup looking
+  like a hang whose last message is `lifespan_provider_startup name=lancedb`.
+  The default sits an order of magnitude above the worst legitimate hold (a
+  large migration is minutes) on purpose: the wait is already visible from the
+  first poll, and against the one case the bound exists for — a holder that is
+  alive but wedged — giving up at 5 minutes buys nothing over 30, while a bound
+  near the legitimate hold turns a slow migration into startup crashes for
+  every waiting process.
+
 ### Changed
 
 - **`cascade_lancedb_optimize_conflict` now records `pruned`** — which

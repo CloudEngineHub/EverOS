@@ -56,8 +56,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import functools
+import signal
 import time
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from typing import Any
 
 from everos.core.errors import ExternalServiceError
 from everos.core.observability.logging import get_logger
@@ -73,6 +77,27 @@ DEFAULT_MAX_RETRY = 3
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS = 10.0
+"""Throttle between ``optimize()`` runs on one kind.
+
+Not a visibility delay. A row is searchable the moment its upsert commits —
+LanceDB flat-scans the unindexed tail, and that covers BM25 as well as vector
+and scalar (verified: a row with ``num_unindexed_rows=1`` is returned by
+``nearest_to_text``). What ``optimize`` buys is folding that row out of the tail
+and into the index, i.e. speed. Sparse writes do not even wait: the scheduler
+uses ``max(0, interval - elapsed)``, so when the last run is already older than
+the interval the next one starts immediately.
+
+It is also the **ceiling on index-directory growth**, which is the reason to
+think twice before lowering it. Every beat leaves new ``_indices/<uuid>/``
+dirs behind, and lance never removes the empty ones, so the accrual rate is
+capped by this interval rather than by write volume: past roughly one write per
+table per interval the beats coalesce and writing harder adds nothing. Measured
+at that ceiling: ~127k dirs/day across three active tables, ~1.8M at the
+~14-day reclaim horizon (~7GB of empty dirs — the horizon is the file wait
+plus the 7-day age gate, see ``_HUSK_MIN_AGE_SECONDS`` in the lancedb
+repository module). Raising this interval lowers that proportionally — 60s
+would cut it to a sixth — at the cost of a longer flat-scanned tail.
+"""
 DEFAULT_OPTIMIZE_HEARTBEAT_SECONDS = 60.0
 _OPTIMIZE_FAILURE_ALERT_THRESHOLD = 5
 """Consecutive **non-benign** ``optimize()`` failures (per kind) before
@@ -121,6 +146,62 @@ while its siblings pruned normally), through an await that sat outside the
 repo's deadline. Generous enough never to fire on a healthy beat (prune's own
 budget is 60s), tight enough that a hang costs one cadence, not forever.
 """
+
+_REBUILD_CONFLICT_BACKOFFS_SECONDS = (600.0, 1800.0, 10800.0)
+"""Delay before each re-attempt at a kind's index rebuild: 10min, 30min, 3h.
+
+Only a lost commit race is retried — lance marks it ``Retryable`` and the table
+is fine; a concurrent writer in another process simply won the manifest. Any
+other failure defers to the next sweep, because retrying a real error just
+burns the write lock.
+
+Scaled to the 12h rebuild cadence, not to the conflict. A seconds-long backoff
+would spend the whole budget inside one contention window and then leave the
+kind unindexed for a full cadence; spreading the attempts over hours means the
+retries land in genuinely different load conditions. The schedule is a
+*deadline recorded on the kind*, never a sleep: :meth:`_rebuild_loop` walks
+kinds sequentially, so sleeping here would park every later kind behind this
+one (7 kinds x 3h would outlast the cadence itself)."""
+
+_REBUILD_LOOP_TICK_SECONDS = 60.0
+"""How often the rebuild loop wakes to pick up due retries between sweeps.
+Cheap: a dict scan per tick, and only kinds with a due deadline do work."""
+
+_LOOP_RESTART_BACKOFF_SECONDS = (5.0, 15.0, 45.0)
+"""Backoff before each restart of a background loop that raised.
+
+The three long-lived loops (drain / heartbeat / rebuild) are plain
+``create_task`` coroutines. Without supervision, one uncaught exception ends
+that loop **permanently and silently**: nothing restarts it, and because
+``self._*_task`` keeps a strong reference the interpreter never prints the
+"Task exception was never retrieved" warning either (that fires on GC). The
+loop's job simply stops happening. So each loop runs under
+:meth:`CascadeWorker._supervise`, which logs, waits, and restarts.
+
+Escalating rather than fixed: a transient cause (a closing event loop, a
+momentarily unavailable table) clears within seconds, while a deterministic
+one would otherwise spin. After the last entry is used the worker asks the
+process to exit (see :meth:`CascadeWorker._request_process_exit`) — a server
+whose projection pipeline is permanently dead should not keep serving as if
+healthy.
+
+The budget is **per incident, not per process lifetime**: a body that ran at
+least :data:`_LOOP_STABLE_RUN_SECONDS` before crashing gets a full budget
+again. Without that reset, rare *independent* transients — one every few
+days, each recovered by a single restart — would still spend the budget one
+by one and SIGTERM the server weeks later on the 4th, which punishes exactly
+the case supervision exists to absorb. This mirrors how process supervisors
+count restarts within a window (systemd ``StartLimitIntervalSec``, Erlang
+``max_restarts`` per ``max_seconds``) rather than forever.
+"""
+
+_LOOP_STABLE_RUN_SECONDS = 60.0
+"""A supervised loop body that ran at least this long before raising is
+treated as a fresh incident (restart budget resets). Sized well above the
+escalation ladder's total (5+15+45 = 65s of *backoff*, but each attempt's
+run time counts from body start): a deterministic crash-on-startup fails in
+milliseconds and cannot reach it, while a loop that did an hour of honest
+work before hitting a transient obviously should not inherit stale strikes."""
 
 DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS = 12 * 60 * 60.0
 """How often (per kind) to do a full ``drop_index + create_index`` rebuild.
@@ -225,11 +306,39 @@ class _KindOptimizerState:
     last_prune_at: float = 0.0
     dirty: bool = False
     optimize_failures: int = 0
-    """Consecutive ``optimize()`` failure count; reset to 0 on success.
-    Drives escalation to ``error`` at
-    :data:`_OPTIMIZE_FAILURE_ALERT_THRESHOLD` so a stuck optimize (which
-    stalls version cleanup and grows the index dir) is not swallowed as a
-    silent warning stream."""
+    """Consecutive ``optimize()`` failures **since the last success**.
+
+    Drives the health verdict and escalation to ``error`` at
+    :data:`_OPTIMIZE_FAILURE_ALERT_THRESHOLD` so a stuck optimize (which stalls
+    version cleanup and grows the index dir) is not swallowed as a silent
+    warning stream.
+
+    Reset **only** by a successful optimize — never by the fallback rebuild it
+    triggers. That distinction is the whole point of splitting this from
+    ``failures_since_fallback``: zeroing the alert counter inside the branch
+    that fires at the threshold made ``optimize_failure_streak >= threshold``
+    effectively unobservable. A table failing 100% of the time cycled
+    1..threshold -> 0 -> 1.., and the only window where a poller could read the
+    threshold value was the sub-second fallback rebuild itself. Same shape as
+    the cross-kind ``max()`` masking bug from run7: a remediation path
+    refreshing the very signal that is supposed to report it.
+    """
+    failures_since_fallback: int = 0
+    """Failures since the last fallback rebuild — the rate limiter.
+
+    Reset by the fallback rebuild so it fires at most once per
+    :data:`_OPTIMIZE_FAILURE_ALERT_THRESHOLD` failures instead of on every
+    failure. This is the job the reset was originally there for; it just used
+    to share a field with the alert signal.
+    """
+    rebuild_retry_at: float = 0.0
+    """Monotonic deadline for re-attempting a rebuild that lost a commit race.
+    ``0`` means nothing pending. Set instead of sleeping so the rebuild loop
+    stays free to serve the other kinds — see
+    :data:`_REBUILD_CONFLICT_BACKOFFS_SECONDS`."""
+    rebuild_attempt: int = 0
+    """Consecutive lost commit races for this kind; indexes into the backoff
+    schedule and resets on any completed rebuild."""
     task: asyncio.Task[None] | None = None
     rebuild_task: asyncio.Task[None] | None = None
     """In-flight rebuild task slot, separate from ``task`` so ordinary
@@ -374,14 +483,114 @@ class CascadeWorker:
             return
         self._stop.clear()
         self._started_at = time.monotonic()
-        self._task = asyncio.create_task(self._run_loop(), name="cascade-worker")
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(), name="cascade-worker-heartbeat"
+        self._task = self._spawn_loop("drain", self._run_loop, "cascade-worker")
+        self._heartbeat_task = self._spawn_loop(
+            "heartbeat", self._heartbeat_loop, "cascade-worker-heartbeat"
         )
-        self._rebuild_task = asyncio.create_task(
-            self._rebuild_loop(), name="cascade-worker-rebuild"
+        self._rebuild_task = self._spawn_loop(
+            "rebuild", self._rebuild_loop, "cascade-worker-rebuild"
         )
         logger.info("cascade_worker_started", batch_size=self._batch_size)
+
+    def _spawn_loop(
+        self,
+        loop_name: str,
+        body: Callable[[], Coroutine[Any, Any, None]],
+        task_name: str,
+    ) -> asyncio.Task[None]:
+        """Start one supervised background loop.
+
+        Two layers, because they fail differently: :meth:`_supervise` restarts
+        the loop body when it raises, and the done-callback is the last-resort
+        observer for the case the supervisor itself ends unexpectedly (a
+        ``BaseException`` it deliberately does not catch). Without the callback
+        that ending is invisible — see :data:`_LOOP_RESTART_BACKOFF_SECONDS`.
+        """
+        task = asyncio.create_task(self._supervise(loop_name, body), name=task_name)
+        task.add_done_callback(functools.partial(self._on_loop_task_done, loop_name))
+        return task
+
+    async def _supervise(
+        self,
+        loop_name: str,
+        body: Callable[[], Coroutine[Any, Any, None]],
+    ) -> None:
+        """Run ``body`` and restart it on failure, bounded, then give up.
+
+        A clean return means the loop observed ``self._stop`` — nothing to do.
+        ``CancelledError`` is re-raised so :meth:`stop` still works. Everything
+        else is logged with the loop name and retried per
+        :data:`_LOOP_RESTART_BACKOFF_SECONDS`; when those are exhausted the
+        process is asked to exit rather than run on with a dead loop.
+
+        The budget counts **consecutive quick crashes**, not crashes over the
+        process lifetime: a body that ran at least
+        :data:`_LOOP_STABLE_RUN_SECONDS` before raising starts a fresh
+        incident. A deterministic crash-on-entry still exhausts the budget in
+        ~65s; independent transients days apart each get the full ladder.
+        """
+        budget = len(_LOOP_RESTART_BACKOFF_SECONDS)
+        strikes = 0
+        while True:
+            if strikes and await self._wait_or_stop(
+                _LOOP_RESTART_BACKOFF_SECONDS[strikes - 1]
+            ):
+                return
+            if self._stop.is_set():
+                return
+            started = time.monotonic()
+            try:
+                await body()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ran = time.monotonic() - started
+                if ran >= _LOOP_STABLE_RUN_SECONDS:
+                    strikes = 0
+                strikes += 1
+                logger.exception(
+                    "cascade_loop_crashed",
+                    loop=loop_name,
+                    strike=strikes,
+                    restarts_left=max(0, budget - strikes + 1),
+                    ran_seconds=round(ran, 1),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                if strikes > budget:
+                    break
+        logger.error("cascade_loop_unrecoverable", loop=loop_name, restarts=budget)
+        self._request_process_exit(loop_name)
+
+    def _on_loop_task_done(self, loop_name: str, task: asyncio.Task[None]) -> None:
+        """Log a supervised loop task that ended without ``stop()`` asking it to."""
+        if task.cancelled() or self._stop.is_set():
+            return
+        exc = task.exception()
+        logger.error(
+            "cascade_loop_task_ended_unexpectedly",
+            loop=loop_name,
+            error=f"{type(exc).__name__}: {exc}" if exc is not None else None,
+        )
+
+    def _request_process_exit(self, loop_name: str) -> None:
+        """Ask this process to terminate so a supervisor can restart it.
+
+        ``SIGTERM`` to our own pid rather than ``os._exit`` so the ASGI server
+        runs its graceful-shutdown path (lifespan shutdown, optimizer flush)
+        instead of dropping in-flight state on the floor.
+
+        This assumes the deployment runs under something that restarts it —
+        systemd ``Restart=always``, Docker ``restart: unless-stopped``, a k8s
+        Deployment. Without one the process just stops, which is still the
+        better outcome: a live server whose projection pipeline is dead answers
+        searches from a silently frozen index.
+
+        Overridable seam for tests — they replace this rather than signal the
+        pytest process.
+        """
+        logger.error("cascade_worker_requesting_process_exit", loop=loop_name)
+        signal.raise_signal(signal.SIGTERM)
 
     async def stop(self) -> None:
         if self._task is None:
@@ -709,11 +918,35 @@ class CascadeWorker:
         try:
             if initial_delay > 0 and await self._wait_or_stop(initial_delay):
                 return
-            # Serialise behind any in-flight rebuild (rare; only during
-            # the 12h sweep). Failures are absorbed in _run_rebuild_once.
+            # Serialise behind any in-flight rebuild (rare; only during the
+            # 12h sweep). Failures are absorbed in _run_rebuild_once.
+            #
+            # Bounded, and symmetric with the wait on the other side: whichever
+            # of the two maintenance jobs arrives second parks on the first, so
+            # an unbounded wait here is the same defect as an unbounded wait
+            # there — this kind's task slot never frees, _schedule_optimize
+            # keeps short-circuiting on it, and that table silently stops being
+            # pruned. It was left unbounded on the argument that
+            # rebuild_indexes carries its own 300s deadline; that only covers
+            # the critical section, not the task's dispatch and teardown around
+            # it, so the transitive bound was never real.
             if state.rebuild_task is not None and not state.rebuild_task.done():
-                with contextlib.suppress(Exception):
-                    await state.rebuild_task
+                try:
+                    async with asyncio.timeout(_MAINTENANCE_TASK_TIMEOUT_SECONDS):
+                        await state.rebuild_task
+                except TimeoutError:
+                    # Give up this beat rather than compact under a live
+                    # rebuild — the two commit on the same manifest, which is
+                    # what the wait exists to prevent. Writes keep the dirty
+                    # flag set, so the next beat retries.
+                    logger.warning(
+                        "cascade_lancedb_optimize_skipped_rebuild_unfinished",
+                        kind=kind,
+                        waited_seconds=_MAINTENANCE_TASK_TIMEOUT_SECONDS,
+                    )
+                    return
+                except Exception:
+                    pass  # _run_rebuild_once already logged and counted it
             while state.dirty and not self._stop.is_set():
                 state.dirty = False
                 state.last_run_at = time.monotonic()
@@ -801,6 +1034,7 @@ class CascadeWorker:
                     await repo.optimize()
             if state is not None:
                 state.optimize_failures = 0
+                state.failures_since_fallback = 0
             logger.debug(
                 "cascade_lancedb_optimized",
                 kind=kind,
@@ -846,9 +1080,12 @@ class CascadeWorker:
                 )
                 return
             failures = 0
+            since_fallback = 0
             if state is not None:
                 state.optimize_failures += 1
+                state.failures_since_fallback += 1
                 failures = state.optimize_failures
+                since_fallback = state.failures_since_fallback
             log = (
                 logger.error
                 if failures >= _OPTIMIZE_FAILURE_ALERT_THRESHOLD
@@ -861,20 +1098,23 @@ class CascadeWorker:
                 consecutive_failures=failures,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            if failures >= _OPTIMIZE_FAILURE_ALERT_THRESHOLD:
+            if since_fallback >= _OPTIMIZE_FAILURE_ALERT_THRESHOLD:
                 logger.info(
                     "cascade_lancedb_optimize_fallback_rebuild",
                     kind=kind,
                     consecutive_failures=failures,
                 )
                 await self._run_rebuild_once(kind)
-                # Reset even when rebuild fails: rate-limits fallback
-                # rebuild to at most once per threshold failures. A
-                # failed rebuild defers cleanup to the 12h periodic
-                # sweep — harmless for correctness (see
-                # _run_rebuild_once docstring).
+                # Reset the *rate limiter* even when the rebuild fails, so the
+                # fallback fires at most once per threshold failures. A failed
+                # rebuild defers cleanup to the 12h periodic sweep — harmless
+                # for correctness (see _run_rebuild_once docstring).
+                #
+                # ``optimize_failures`` is deliberately NOT reset here: it is
+                # the health signal, and zeroing it in the branch that fires at
+                # the threshold is what made the alert unreachable.
                 if state is not None:
-                    state.optimize_failures = 0
+                    state.failures_since_fallback = 0
 
     async def _heartbeat_loop(self) -> None:
         """Periodic safety net for the optimizer.
@@ -925,10 +1165,30 @@ class CascadeWorker:
             if self._stop.is_set():
                 return
             await self._run_rebuild_once(kind)
+        last_sweep = time.monotonic()
+        # Never coarser than the configured cadence: the tick exists to give
+        # conflict retries a 60s granularity against a 12h sweep, and must not
+        # quantise a deployment (or a test) that sets a shorter interval.
+        tick = min(_REBUILD_LOOP_TICK_SECONDS, self._optimize_rebuild_interval)
         while not self._stop.is_set():
-            if await self._wait_or_stop(self._optimize_rebuild_interval):
+            if await self._wait_or_stop(tick):
                 return
+            now = time.monotonic()
+            if now - last_sweep >= self._optimize_rebuild_interval:
+                last_sweep = now
+                for kind in self._handlers:
+                    if self._stop.is_set():
+                        return
+                    await self._run_rebuild_once(kind)
+                continue
+            # Between sweeps, serve only kinds whose conflict backoff is due.
             for kind in self._handlers:
+                state = self._optimizer_states.get(kind)
+                if state is None or not state.rebuild_retry_at:
+                    continue
+                if now < state.rebuild_retry_at:
+                    continue
+                state.rebuild_retry_at = 0.0
                 if self._stop.is_set():
                     return
                 await self._run_rebuild_once(kind)
@@ -960,8 +1220,32 @@ class CascadeWorker:
             and not state.task.done()
             and state.task is not asyncio.current_task()
         ):
-            with contextlib.suppress(Exception):
-                await state.task
+            try:
+                # Bounded: an optimize task that hangs must not park the rebuild
+                # loop behind it. Same defect class as the table-handle await —
+                # a wait with no deadline in a path a scheduler depends on.
+                async with asyncio.timeout(_MAINTENANCE_TASK_TIMEOUT_SECONDS):
+                    await state.task
+            except TimeoutError:
+                # Skip this sweep rather than rebuild concurrently with an
+                # optimize that is still running: dropping indices under it is
+                # exactly the interleaving this wait exists to prevent. The 12h
+                # loop retries, and the prune-staleness signal covers the stall.
+                logger.warning(
+                    "cascade_lancedb_rebuild_skipped_optimize_unfinished",
+                    kind=kind,
+                    waited_seconds=_MAINTENANCE_TASK_TIMEOUT_SECONDS,
+                )
+                return
+            except Exception:
+                pass  # the optimize runner already logged and counted it
+        # Retry a lost commit race in place. Lance labels it "Retryable" and
+        # means it: the rebuild transaction was preempted by a concurrent
+        # writer (another process, since the write lock is in-process only) and
+        # nothing about the table is wrong. Without a retry, a conflict costs a
+        # whole rebuild cadence — 12h in production — for what a second-scale
+        # backoff resolves. A soak run at 600s cadence hit 3 conflicts in 119
+        # attempts (2.5%), all while a concurrent CLI storm was running.
         rebuild_task = asyncio.create_task(
             repo.rebuild_indexes(), name=f"cascade-rebuild-{kind}-inner"
         )
@@ -969,12 +1253,35 @@ class CascadeWorker:
         try:
             await rebuild_task
             logger.info("cascade_lancedb_rebuilt", kind=kind)
+            state.rebuild_attempt = 0
+            state.rebuild_retry_at = 0.0
         except Exception as exc:
-            logger.warning(
-                "cascade_lancedb_rebuild_failed",
-                kind=kind,
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            attempt = state.rebuild_attempt
+            if _is_benign_commit_conflict(exc) and attempt < len(
+                _REBUILD_CONFLICT_BACKOFFS_SECONDS
+            ):
+                # Lost the manifest race to a concurrent writer; the table is
+                # fine. Record a deadline instead of sleeping so the other
+                # kinds in this sweep are not parked behind the backoff.
+                delay = _REBUILD_CONFLICT_BACKOFFS_SECONDS[attempt]
+                state.rebuild_attempt = attempt + 1
+                state.rebuild_retry_at = time.monotonic() + delay
+                logger.info(
+                    "cascade_lancedb_rebuild_conflict_retry_scheduled",
+                    kind=kind,
+                    attempt=attempt,
+                    retry_in_seconds=delay,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                state.rebuild_attempt = 0
+                state.rebuild_retry_at = 0.0
+                logger.warning(
+                    "cascade_lancedb_rebuild_failed",
+                    kind=kind,
+                    attempt=attempt,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         finally:
             if state.rebuild_task is rebuild_task:
                 state.rebuild_task = None
