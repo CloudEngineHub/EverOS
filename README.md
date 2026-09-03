@@ -21,7 +21,7 @@
 
 <br>
 
-- [Why Ever OS](#why-ever-os)
+- [Why EverOS](#why-ever-os)
 - [Ecosystem Integrations](#ecosystem-integrations)
 - [Quick Start](#quick-start)
 - [Use Cases](#use-cases)
@@ -34,7 +34,7 @@
 </details>
 
 
-## Why Ever OS
+## Why EverOS
 
 EverOS is a Python library and local-first memory runtime for agents and
 makers. It gives one portable memory layer across coding assistants, apps,
