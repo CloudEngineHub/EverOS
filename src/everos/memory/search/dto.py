@@ -35,6 +35,19 @@ class SearchMethod(StrEnum):
     VECTOR = "vector"
     HYBRID = "hybrid"
     AGENTIC = "agentic"
+    LLM_MULTIROUND = "llm_multiround"
+    """LLM-guided iterative multi-round episode retrieval (per-sub-query RRF blocks).
+
+    Each round fuses every current sub-query's BM25+vector recall with RRF
+    INDEPENDENTLY (round 0 = one original-question block), shows an injected
+    decider the labelled blocks plus the core accumulated so far, and lets it
+    pin core and issue gap-covering sub-queries. The final injection is
+    core-first + each sub-query's top-1 guarantee + max-RRF-score fill; there is
+    no cross-encoder anywhere. Unlike AGENTIC's fixed round1+round2 this is
+    genuinely iterative, and the decider is pluggable -- a prompted LLM by
+    default, a trained policy in Phase 2, which makes this loop the RL
+    environment. Needs an LLM + embedding provider. User memory only.
+    """
 
 
 class FilterNode(BaseModel):
