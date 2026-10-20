@@ -33,6 +33,7 @@ from .lifespans import (
     CascadeLifespanProvider,
     LanceDBLifespanProvider,
     LLMLifespanProvider,
+    MemorizeQueueLifespanProvider,
     OmeLifespanProvider,
     ParserLifespanProvider,
     SqliteLifespanProvider,
@@ -46,6 +47,7 @@ from .routes import (
     metrics,
     ome,
     search,
+    tasks,
 )
 
 logger = get_logger(__name__)
@@ -75,7 +77,8 @@ def create_app(
             ``[TracingLifespanProvider(), MetricsLifespanProvider(),
             LLMLifespanProvider(), ParserLifespanProvider(),
             SqliteLifespanProvider(), LanceDBLifespanProvider(),
-            CascadeLifespanProvider(), OmeLifespanProvider()]``.
+            CascadeLifespanProvider(), MemorizeQueueLifespanProvider(),
+            OmeLifespanProvider()]``.
 
     Returns:
         FastAPI: Configured application instance.
@@ -91,6 +94,7 @@ def create_app(
             SqliteLifespanProvider(),
             LanceDBLifespanProvider(),
             CascadeLifespanProvider(),
+            MemorizeQueueLifespanProvider(),
             OmeLifespanProvider(),
         ]
 
@@ -143,6 +147,7 @@ def create_app(
     # Operational, not a memory API: it stops a background subsystem. Mounted on
     # both prefixes so a caller does not have to know which one this build serves.
     app.include_router(cascade.router, prefix="/api/v1")
+    app.include_router(tasks.router, prefix="/api/v1")
     # v2 — cloud-aligned name, same routers.
     app.include_router(memorize.router, prefix="/api/v2")
     app.include_router(search.router, prefix="/api/v2")
@@ -150,6 +155,7 @@ def create_app(
     app.include_router(ome.router, prefix="/api/v2")
     app.include_router(knowledge.router, prefix="/api/v2")
     app.include_router(cascade.router, prefix="/api/v2")
+    app.include_router(tasks.router, prefix="/api/v2")
 
     logger.info("app_created", docs_enabled=enable_docs)
     return app
