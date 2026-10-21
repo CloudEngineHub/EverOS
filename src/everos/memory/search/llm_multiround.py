@@ -46,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -403,43 +402,27 @@ class LLMRoundDecider:
 def _parse_decision(text: str) -> dict:
     """Extract the JSON decision object from an LLM reply (tolerant of prose).
 
-    Tries the widest ``{...}`` span first (the common single-object reply);
-    if that fails to parse, falls back to scanning for the first brace-balanced
-    object, so a stray ``{`` / ``}`` in surrounding prose cannot corrupt the
-    parse (the greedy span would otherwise swallow it and raise). Raises
-    ``ValueError`` only when no ``dict`` object can be recovered — the caller
-    treats that as a safe stop with no core.
+    Decodes with the JSON decoder from every ``{`` in the reply, in order,
+    and returns the first object that parses as a dict; the decoder itself
+    knows where a string value ends, so braces in prose before or after the
+    object and braces inside the object's string values cannot corrupt the
+    result. Raises ``ValueError`` only when no ``dict`` object can be
+    recovered -- the caller treats that as a safe stop with no core.
+
+    The two earlier strategies both broke on braces: a widest ``{...}`` span
+    swallowed a stray ``}`` after the object, and a brace counter that did
+    not understand strings returned the ``{}`` inside a value as the
+    decision (found by the parse law in the property tests).
     """
-    candidates: list[str] = []
-    greedy = re.search(r"\{.*\}", text, re.DOTALL)
-    if greedy:
-        candidates.append(greedy.group())
-    candidates.extend(_balanced_objects(text))
-    for cand in candidates:
+    decoder = json.JSONDecoder()
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
         try:
-            obj = json.loads(cand)
+            obj, _ = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
             return obj
     raise ValueError(f"no JSON object in decider reply: {text[:120]!r}")
-
-
-def _balanced_objects(text: str) -> list[str]:
-    """Yield brace-balanced ``{...}`` substrings, outermost first."""
-    out: list[str] = []
-    depth = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth > 0:
-            depth -= 1
-            if depth == 0 and start >= 0:
-                out.append(text[start : i + 1])
-    return out
 
 
 def _coerce_core_indices(raw: object, n_evidence: int) -> list[int]:

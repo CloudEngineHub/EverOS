@@ -31,11 +31,13 @@ from pydantic import BaseModel
 from everos.component.llm import get_llm_client
 from everos.config import load_settings
 from everos.core.context import resolve_request_id
+from everos.core.observability.logging import get_logger
 from everos.core.observability.tracing import memory_span
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.config import OMEConfig
 from everos.infra.ome.engine import OfflineEngine
 from everos.infra.persistence.markdown import EpisodeWriter
+from everos.memory import IngestResult
 from everos.memory.extract.ingest import process as ingest_process
 from everos.memory.extract.pipeline import (
     AgentMemoryPipeline,
@@ -52,8 +54,10 @@ from everos.memory.strategies import (
     trigger_profile_clustering,
     trigger_skill_clustering,
 )
-from everos.service._boundary import buffer_messages, prepare_cells
+from everos.service._boundary import BoundaryOutcome, buffer_messages, prepare_cells
 from everos.service._session_lock import get_session_lock
+
+logger = get_logger(__name__)
 
 
 class MemorizeResult(BaseModel):
@@ -61,6 +65,68 @@ class MemorizeResult(BaseModel):
 
     message_count: int
     status: Literal["accumulated", "extracted"]
+
+
+class ExtractionSupervisor:
+    """Owns the extraction tasks that may outlive their request.
+
+    A request whose client went away is cancelled while its extraction
+    runs; the memcell is already committed, so the extraction must finish.
+    ``supervise`` keeps the task referenced until it ends and retrieves its
+    outcome: a failure is logged with the memcell ids (it is not retried
+    here -- the pipelines write markdown and emit events and are not
+    idempotent, the same reason the async queue does not retry a failed
+    delivery), and ``drain`` lets the lifespan wait for what is still
+    running at shutdown instead of dropping it.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[MemorizeResult]] = set()
+
+    def supervise(
+        self,
+        coro: Any,
+        *,
+        session_id: str,
+        memcell_ids: list[str],
+    ) -> asyncio.Task[MemorizeResult]:
+        task: asyncio.Task[MemorizeResult] = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+
+        def _done(t: asyncio.Task[MemorizeResult]) -> None:
+            self._tasks.discard(t)
+            if t.cancelled():
+                logger.error(
+                    "memorize_extraction_cancelled",
+                    session_id=session_id,
+                    memcell_ids=memcell_ids,
+                )
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error(
+                    "memorize_extraction_failed",
+                    session_id=session_id,
+                    memcell_ids=memcell_ids,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        task.add_done_callback(_done)
+        return task
+
+    @property
+    def in_flight(self) -> int:
+        return len(self._tasks)
+
+    async def drain(self, wait_seconds: float) -> int:
+        """Wait up to ``wait_seconds`` for running extractions; return what is left."""
+        pending = {t for t in self._tasks if not t.done()}
+        if pending:
+            await asyncio.wait(pending, timeout=wait_seconds)
+        return sum(1 for t in self._tasks if not t.done())
+
+
+extractions = ExtractionSupervisor()
 
 
 # Lazy singletons ────────────────────────────────────────────────────────────
@@ -196,12 +262,19 @@ async def memorize(
 
     Concurrency: serialised per ``(app_id, project_id, session_id)`` via
     :func:`everos.service._session_lock.get_session_lock`. The lock
-    spans the entire read-merge-boundary-write cycle so concurrent /add
-    calls on the same session cannot lose-update each other's tail.
-    An outer ``asyncio.timeout`` (configured by
-    ``settings.memorize.session_lock_timeout_seconds``) ensures a stuck
-    LLM cannot hold the lock indefinitely — on timeout the task is
-    cancelled and ``async with`` auto-releases the lock.
+    spans the read-merge-boundary-write cycle so concurrent /add calls
+    on the same session cannot lose-update each other's tail.
+
+    ``settings.memorize.session_lock_timeout_seconds`` bounds the two
+    places a call can hang while something else waits on the lock: the
+    wait for the lock itself, and the boundary LLM call. It no longer
+    cancels the call as a whole: once the boundary has decided, the
+    writes that make the cells durable and the extraction of those cells
+    run to completion. A timeout that landed after the memcell row was
+    committed and the buffer consumed used to cancel the extraction, and
+    nothing retried it -- the cell stayed without an episode for good
+    (found by the concurrent-memorize property test). Extraction runs
+    after the lock is released; it only reads memcells, never the buffer.
     """
     settings = load_settings()
     mode = settings.memorize.mode
@@ -233,15 +306,42 @@ async def memorize(
             f"{payload.get('app_id', 'default')}\x1f"
             f"{payload.get('project_id', 'default')}\x1f{session_id}"
         )
-        async with asyncio.timeout(settings.memorize.session_lock_timeout_seconds):
-            async with get_session_lock(lock_key):
-                return await _memorize_locked(
-                    payload,
-                    mode=mode,
-                    boundary_cfg=boundary_cfg,
-                    is_final=is_final,
-                    defer_extraction=defer_extraction,
-                )
+        timeout_s = settings.memorize.session_lock_timeout_seconds
+        lock = get_session_lock(lock_key)
+        async with asyncio.timeout(timeout_s):
+            await lock.acquire()
+        try:
+            prepared = await _memorize_locked(
+                payload,
+                mode=mode,
+                boundary_cfg=boundary_cfg,
+                is_final=is_final,
+                defer_extraction=defer_extraction,
+                boundary_timeout=timeout_s,
+            )
+        finally:
+            lock.release()
+        if isinstance(prepared, MemorizeResult):
+            return prepared
+        ingested, boundary = prepared
+        # The cells exist, so their extraction must not die with a cancelled
+        # request (a client that went away). The task is owned by the
+        # module's supervisor, which keeps it, retrieves its outcome and
+        # waits for it at shutdown; the request only shields it.
+        extraction = extractions.supervise(
+            _extract(payload, ingested, boundary, mode=mode),
+            session_id=session_id,
+            memcell_ids=boundary.memcell_ids,
+        )
+        try:
+            return await asyncio.shield(extraction)
+        except asyncio.CancelledError:
+            logger.warning(
+                "memorize_extraction_continues_after_cancel",
+                session_id=session_id,
+                memcell_ids=boundary.memcell_ids,
+            )
+            raise
 
 
 async def _memorize_locked(
@@ -251,8 +351,14 @@ async def _memorize_locked(
     boundary_cfg: Any,
     is_final: bool,
     defer_extraction: bool,
-) -> MemorizeResult:
-    """Inner critical section — runs under the per-session lock."""
+    boundary_timeout: float | None = None,
+) -> MemorizeResult | tuple[IngestResult, BoundaryOutcome]:
+    """Inner critical section — runs under the per-session lock.
+
+    Returns the result when nothing reached the boundary, or the
+    ingested batch and the boundary outcome for :func:`_extract` to run
+    once the lock is released.
+    """
     ingested = await ingest_process(payload)
     if defer_extraction and not is_final:
         buffered = await buffer_messages(ingested, mode=mode)
@@ -273,6 +379,7 @@ async def _memorize_locked(
             prompt_loader=_get_prompt_loader(),
             hard_token_limit=boundary_cfg.hard_token_limit,
             hard_msg_limit=boundary_cfg.hard_msg_limit,
+            timeout_seconds=boundary_timeout,
         )
 
     if not boundary.cells:
@@ -281,7 +388,17 @@ async def _memorize_locked(
             message_count=len(payload.get("messages", [])),
             status=_merge_status(boundary.status, "skipped"),
         )
+    return ingested, boundary
 
+
+async def _extract(
+    payload: dict[str, Any],
+    ingested: IngestResult,
+    boundary: BoundaryOutcome,
+    *,
+    mode: Literal["chat", "agent"],
+) -> MemorizeResult:
+    """Run the extraction pipelines for the cells the boundary stage wrote."""
     user_task = _get_user_pipeline().run(
         ingested,
         cells=boundary.cells,

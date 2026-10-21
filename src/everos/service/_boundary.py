@@ -25,6 +25,7 @@ insert its own row per cell.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -42,6 +43,7 @@ from everalgo.types import (
 from everalgo.types import ToolCall as AlgoToolCall
 
 from everos.component.utils.datetime import from_timestamp, to_timestamp_ms
+from everos.core.errors import SessionBufferQuarantinedError
 from everos.core.observability.logging import get_logger
 from everos.infra.persistence.sqlite import (
     Memcell,
@@ -60,6 +62,15 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _TRACK = "memorize"
+_TRACK_QUARANTINE = "quarantine"
+"""Where a session's buffer goes when the model keeps failing to segment it."""
+_POISON_CALLS = 3
+"""Consecutive calls whose boundary attempts all returned unusable replies
+before the session's buffer is quarantined (each call retries the model
+``_BOUNDARY_MAX_ATTEMPTS`` times first)."""
+_unusable_replies: dict[tuple[str, str, str], int] = {}
+"""Consecutive unusable-reply calls per (app, project, session); in memory,
+so a restart simply starts the count again."""
 """Shared track used for both the unprocessed-buffer and the memcell
 ledger — boundary detection is mode-dispatched but single-pass, so it
 does not need per-pipeline separation."""
@@ -125,8 +136,15 @@ async def prepare_cells(
     prompt_loader: PromptLoader,
     hard_token_limit: int,
     hard_msg_limit: int,
+    timeout_seconds: float | None = None,
 ) -> BoundaryOutcome:
-    """Run the boundary stage end-to-end and persist tail back to buffer."""
+    """Run the boundary stage end-to-end and persist tail back to buffer.
+
+    ``timeout_seconds`` bounds each boundary LLM attempt (a ``TimeoutError``
+    propagates). It is the one step here that can hang, and it runs before
+    any write, so a timeout leaves the buffer and the memcell table exactly
+    as they were.
+    """
     app_id = ingested.app_id
     project_id = ingested.project_id
     fresh = _filter_for_mode(ingested.messages, mode)
@@ -157,15 +175,59 @@ async def prepare_cells(
         return _empty_outcome(status="skipped", message_count=len(fresh))
 
     boundary_prompt = prompt_loader.load("boundary_detection")
-    cells, tail = await _detect(
-        merged,
-        mode=mode,
-        llm_client=llm_client,
-        prompt=boundary_prompt,
-        is_final=is_final,
-        hard_token_limit=hard_token_limit,
-        hard_msg_limit=hard_msg_limit,
-    )
+    scope = (app_id, project_id, ingested.session_id)
+    try:
+        cells, tail = await _detect(
+            merged,
+            mode=mode,
+            llm_client=llm_client,
+            prompt=boundary_prompt,
+            is_final=is_final,
+            hard_token_limit=hard_token_limit,
+            hard_msg_limit=hard_msg_limit,
+            timeout_seconds=timeout_seconds,
+        )
+    except ValueError:
+        # The model answered, the answer was unusable, three attempts in a
+        # row. Once is noise; the same session failing call after call means
+        # the buffer holds something the model cannot segment, and every
+        # later call would merge it back in and fail the same way. Set the
+        # buffer aside and let the session go on. Infrastructure errors are
+        # not ValueError and never reach here.
+        _unusable_replies[scope] = _unusable_replies.get(scope, 0) + 1
+        if _unusable_replies[scope] < _POISON_CALLS:
+            raise
+        _unusable_replies.pop(scope, None)
+        buffered_ids = {r.message_id for r in buffer_rows}
+        fresh_rows = [
+            _canonical_to_row(m, app_id, project_id)
+            for m in merged
+            if m.message_id not in buffered_ids
+        ]
+        moved = await unprocessed_buffer_repo.quarantine(
+            ingested.session_id,
+            _TRACK,
+            _TRACK_QUARANTINE,
+            fresh_rows,
+            app_id=app_id,
+            project_id=project_id,
+        )
+        logger.error(
+            "memorize_session_buffer_quarantined",
+            extra={
+                "session_id": ingested.session_id,
+                "app_id": app_id,
+                "project_id": project_id,
+                "messages": moved,
+                "failed_calls": _POISON_CALLS,
+            },
+        )
+        raise SessionBufferQuarantinedError(
+            f"boundary detection failed on {_POISON_CALLS} consecutive calls "
+            f"for session {ingested.session_id!r}; {moved} buffered messages were "
+            f"moved to the {_TRACK_QUARANTINE!r} track so the session can continue"
+        ) from None
+    _unusable_replies.pop(scope, None)
 
     if not cells:
         # boundary returned an empty cells set → roll the merged slice
@@ -248,30 +310,34 @@ async def _detect(
     is_final: bool,
     hard_token_limit: int,
     hard_msg_limit: int,
+    timeout_seconds: float | None = None,
 ) -> tuple[list[MemCell], list[ConversationItem]]:
     # Retry on ValueError to absorb transient LLM JSON-parse failures from
-    # the everalgo boundary detector; non-ValueError errors propagate.
+    # the everalgo boundary detector; non-ValueError errors propagate. Each
+    # attempt is bounded on its own: the budget is the time a call may hold
+    # the session lock, and a TimeoutError leaves nothing written.
     last_err: ValueError | None = None
     for attempt in range(_BOUNDARY_MAX_ATTEMPTS):
         try:
-            if mode == "chat":
-                chat_msgs = [_to_chat_message(m) for m in merged]
-                result = await detect_boundaries(
-                    chat_msgs,
-                    llm=llm_client,
-                    prompt=prompt,
-                    is_final=is_final,
-                    hard_token_limit=hard_token_limit,
-                    hard_msg_limit=hard_msg_limit,
-                )
+            async with asyncio.timeout(timeout_seconds):
+                if mode == "chat":
+                    chat_msgs = [_to_chat_message(m) for m in merged]
+                    result = await detect_boundaries(
+                        chat_msgs,
+                        llm=llm_client,
+                        prompt=prompt,
+                        is_final=is_final,
+                        hard_token_limit=hard_token_limit,
+                        hard_msg_limit=hard_msg_limit,
+                    )
+                    return list(result.cells), list(result.tail)
+                # Agent mode — facade does filter→detect→remap to preserve
+                # tool items. AgentBoundaryDetector intentionally does not
+                # expose hard limits; the boundary primitive's defaults apply.
+                items = [_to_conversation_item(m) for m in merged]
+                detector = AgentBoundaryDetector(llm=llm_client)
+                result = await detector.adetect(items, is_final=is_final, prompt=prompt)
                 return list(result.cells), list(result.tail)
-            # Agent mode — facade does filter→detect→remap to preserve tool
-            # items. AgentBoundaryDetector intentionally does not expose hard
-            # limits; the boundary primitive's defaults apply.
-            items = [_to_conversation_item(m) for m in merged]
-            detector = AgentBoundaryDetector(llm=llm_client)
-            result = await detector.adetect(items, is_final=is_final, prompt=prompt)
-            return list(result.cells), list(result.tail)
         except ValueError as err:
             last_err = err
             logger.warning(

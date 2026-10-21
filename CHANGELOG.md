@@ -85,6 +85,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OME: concurrent run-record writes could starve one another until the
+  busy timeout.** Every store write opened its own connection and left the
+  waiting to SQLite's busy handler, which sleeps and retries, so under
+  several writers a late arrival could keep taking the write lock ahead of
+  an early one. On Windows, where a commit costs 30-80 ms, a writer starved
+  that way hit the 5 s timeout and failed with `database is locked`
+  (measured on CI: 16 writers, p99 3.8 s, one failure in 30 s), which
+  silently drops the run when it lands on the RUNNING insert and leaves the
+  row RUNNING until a restart when it lands on a status update. Writers now
+  queue on an in-process lock that nobody overtakes before touching the
+  file. The engine also keeps one connection open for its lifetime: with
+  a connection per statement, every close used to be the last close, which
+  checkpoints and deletes the WAL files under an exclusive lock and on
+  Windows held a fresh connection's first statement past the same timeout. Found by the OME run state-machine test, which failed on Windows CI.
+- **A message the model can never segment no longer blocks its session.**
+  Boundary detection retries an unusable reply three times per call; a
+  message that always produced one stayed in the session's buffer, every
+  later `/add` or `/flush` merged it back in and failed the same way, and the
+  session was stuck until someone cleared the buffer by hand (the async queue
+  marked that session's batches `failed` one after another). The third
+  consecutive call that ends this way now moves the session's buffer and the
+  call's own messages to the `quarantine` track of `unprocessed_buffer`,
+  answers `422 INVALID_INPUT` naming the session and the count, and the next
+  call starts from an empty buffer. Infrastructure failures (no quota,
+  network) are not counted and still propagate as `EXTERNAL_SERVICE_UNAVAILABLE`,
+  so a buffer waits out an outage.
+- **A session-lock timeout could cancel extraction after the memcell was
+  written.** `memorize()` wrapped the whole call in
+  `session_lock_timeout_seconds`; a timeout that landed after the boundary
+  had written the memcell row and consumed the buffer cancelled the
+  extraction pipelines, and nothing retried them: the cell stayed without an
+  episode for good. The timeout now bounds the two places a call can hang
+  while another waits on the lock, the lock wait and the boundary LLM call,
+  both of which run before any write; once a cell is committed its
+  extraction runs to completion, after the lock is released and shielded
+  from a cancelled request. Found by a property test that lands random
+  concurrent calls under random timeouts.
+- **A replayed clustering run inflated the cluster's count.** OME delivers a
+  strategy run at least once; when `trigger_profile_clustering` or
+  `trigger_skill_clustering` ran again for an episode or case it had already
+  folded in (a crash after the upsert, a retry after the emit failed), it
+  folded it in a second time: the member row was deduplicated but `count`
+  rose and the centroid was re-weighted, and `extract_user_profile` gates on
+  that count. An entry already among the owner's members is now left where it
+  is; the downstream event is still emitted.
+- **OME `inspect` ignored the Counter gate's cooldown.** The dry run compared
+  the bucket's counter with the threshold only, so during a cooldown window
+  it reported `will_run: true` for an event `dispatch` would hold back. The
+  store now answers the dry run with the same rule `dispatch` applies
+  (threshold and cooldown, one clock).
+- **Knowledge: a failed `PUT /knowledge/{doc_id}` could leave two
+  directories for one document, or bury the old one inside the new.** The
+  replace path backs the document's directory up, writes the new one and
+  restores the backup on failure; when the failure came *after* the writer
+  had created the new directory (the original-file step, for one), the
+  restore moved the backup inside it if the name was unchanged, or left it
+  next to the restored one if the title or category had changed. The
+  half-written directory is now removed before the backup comes back.
+- **A hand-edited `entry_count` could make a daily-log writer reuse an entry
+  id.** The episode, atomic-fact, foresight and agent-case writers allocated
+  the next id from the frontmatter's `entry_count` alone, so lowering it by
+  hand made the next append produce an id the file already held (the index
+  keeps one of the two), and a non-numeric value raised a `TypeError`. The
+  next id is now allocated from the higher of `entry_count` and the highest
+  sequence number already in the file, and a frontmatter that disagrees is
+  logged.
+- **OME `wait_for_event` returned while a retry was still pending.** The
+  runner records a failed attempt as `FAILED` before its backoff sleep and
+  gives the retry a fresh run id, so during the backoff the event's only row
+  is `FAILED`; `wait_for_event` counted that as terminal and returned.
+  Reflection waits on it before deprecating what the extraction replaced, so
+  it could act on an outcome that was not final. `FAILED` now means "retry
+  pending"; a failure with no retry left is `DEAD_LETTER`, as before.
+- **`to_timestamp_ms` is now the exact inverse of `from_timestamp_ms`.** It
+  computed `int(timestamp() * 1000)`, and the float product sat just below
+  the integer for about 0.6 % of instants (1095954883735 came back as
+  1095954883734); integer arithmetic on the timedelta since the epoch
+  replaces it.
+- **The watcher classified md files the scanner never visits.** Its kind
+  matcher was anchored on the right only, so a path with extra leading
+  components (`x/app/project/users/u/episodes/episode-2026-01-01.md`) was
+  accepted and queued while the root-anchored scanner glob ignored it; the
+  match now requires the same number of path components.
+- **`default_app` / `default_project` are rejected as ids.** They are the
+  on-disk directory names of the default scope, so an app with that literal
+  id shared the default app's directory and its index rows were attributed
+  to `default`. The API now answers `422` for them.
+- **Search: a duplicate id inside the dense pool kept its last score, not
+  its highest**, and the multi-round decider's JSON parser gave up on a reply
+  with a stray `{` in the prose before the object (its docstring promised
+  otherwise); it now also decodes from every brace.
 - **Cascade worker: a bounded wait between optimize and rebuild cancelled the
   task it waited on.** The optimize runner waits up to 180 s for an in-flight
   index rebuild of the same kind, and the rebuild loop waits for an in-flight
